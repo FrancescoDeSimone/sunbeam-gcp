@@ -1,0 +1,848 @@
+# =============================================================================
+# OpenStack Demo Environment — Terraform Configuration
+#
+# This file is rendered by the outer GCP Terraform (via templatefile) and
+# written to node-1 at /opt/sunbeam/demo-env/main.tf. It provisions a full
+# demo environment inside the Sunbeam OpenStack cluster:
+#
+#   - Identity: 3 domains, 3 projects, 5 users, 4 groups, role assignments
+#   - Networking: 2 project networks, internal + external routers, 3 security
+#     groups with rules, floating IPs
+#   - Compute: 3 AZs (1 host each), 2 server groups, 3 VMs (jumphost, web-1,
+#     db-1) using m1.tiny and existing ubuntu image
+#   - Storage: 1 Cinder volume for db-1
+#   - Shared Filesystem: 1 Manila NFS share (conditional)
+#   - Load Balancer: 1 LB with 1 member on frontend subnet (conditional)
+#   - DNS: example.com zone with www A record (conditional)
+#   - Object Storage: 1 container with 10 test objects
+#
+# Two providers:
+#   - admin (default) — for domains, projects, users, AZs, provider network
+#   - Alice (aliased) — for VMs, volumes, shares, LB (Production project scope)
+#
+# NOTE: $${...} in this file are literal Terraform interpolations for the
+# INNER config. $${...} without doubling are substituted by the OUTER GCP Terraform.
+# =============================================================================
+
+terraform {
+  required_version = ">= 1.0.0"
+  required_providers {
+    openstack = {
+      source  = "terraform-provider-openstack/openstack"
+      version = "~> 3.0"
+    }
+  }
+}
+
+# --- Variables (populated via terraform.tfvars on node-1) --------------------
+
+variable "auth_url" {
+  description = "Keystone endpoint URL"
+  type        = string
+}
+
+variable "cloud_admin_password" {
+  description = "Cloud Admin password"
+  type        = string
+  sensitive   = true
+}
+
+variable "cloud_admin_name" {
+  description = "Cloud Admin username"
+  type        = string
+  default     = "admin"
+}
+
+variable "cloud_admin_project" {
+  description = "Cloud Admin default project"
+  type        = string
+  default     = "admin"
+}
+
+variable "cloud_admin_domain" {
+  description = "Cloud Admin domain"
+  type        = string
+  default     = "admin_domain"
+}
+
+variable "region" {
+  description = "OpenStack region name"
+  type        = string
+  default     = "RegionOne"
+}
+
+variable "insecure" {
+  description = "Trust self-signed SSL certificates"
+  type        = bool
+  default     = true
+}
+
+variable "ssh_public_key" {
+  description = "SSH public key content for Alice's keypair"
+  type        = string
+}
+
+# --- Cloud Admin Provider (default) -----------------------------------------
+
+provider "openstack" {
+  user_name   = var.cloud_admin_name
+  password    = var.cloud_admin_password
+  tenant_name = var.cloud_admin_project
+  domain_name = var.cloud_admin_domain
+  auth_url    = var.auth_url
+  region      = var.region
+  insecure    = var.insecure
+}
+
+# =============================================================================
+# IDENTITY
+# =============================================================================
+
+# --- Domains -----------------------------------------------------------------
+
+resource "openstack_identity_project_v3" "administration-domain" {
+  name        = "Administration"
+  description = "Administration domain"
+  is_domain   = true
+}
+
+resource "openstack_identity_project_v3" "engineering-domain" {
+  name        = "Engineering"
+  description = "Engineering domain"
+  is_domain   = true
+}
+
+resource "openstack_identity_project_v3" "support-domain" {
+  name        = "Support"
+  description = "Support domain"
+  is_domain   = true
+}
+
+# --- Projects (in Engineering domain) ----------------------------------------
+
+resource "openstack_identity_project_v3" "production-project" {
+  name        = "Production"
+  description = "Accessible by members of DevOps group"
+  domain_id   = openstack_identity_project_v3.engineering-domain.id
+}
+
+resource "openstack_identity_project_v3" "staging-project" {
+  name        = "Staging"
+  description = "Accessible by members of DevOps and Developers groups"
+  domain_id   = openstack_identity_project_v3.engineering-domain.id
+}
+
+resource "openstack_identity_project_v3" "development-project" {
+  name        = "Development"
+  description = "Accessible by members of Developers group"
+  domain_id   = openstack_identity_project_v3.engineering-domain.id
+}
+
+# --- Users -------------------------------------------------------------------
+
+resource "openstack_identity_user_v3" "alice" {
+  domain_id                             = openstack_identity_project_v3.engineering-domain.id
+  default_project_id                    = openstack_identity_project_v3.production-project.id
+  name                                  = "Alice"
+  password                              = "Alice"
+  ignore_change_password_upon_first_use = true
+  multi_factor_auth_enabled             = false
+}
+
+resource "openstack_identity_user_v3" "bob" {
+  domain_id                             = openstack_identity_project_v3.engineering-domain.id
+  default_project_id                    = openstack_identity_project_v3.staging-project.id
+  name                                  = "Bob"
+  password                              = "Bob"
+  ignore_change_password_upon_first_use = true
+  multi_factor_auth_enabled             = false
+}
+
+resource "openstack_identity_user_v3" "cindy" {
+  domain_id                             = openstack_identity_project_v3.engineering-domain.id
+  default_project_id                    = openstack_identity_project_v3.staging-project.id
+  name                                  = "Cindy"
+  password                              = "Cindy"
+  ignore_change_password_upon_first_use = true
+  multi_factor_auth_enabled             = false
+}
+
+resource "openstack_identity_user_v3" "dave" {
+  domain_id                             = openstack_identity_project_v3.engineering-domain.id
+  default_project_id                    = openstack_identity_project_v3.development-project.id
+  name                                  = "Dave"
+  password                              = "Dave"
+  ignore_change_password_upon_first_use = true
+  multi_factor_auth_enabled             = false
+}
+
+resource "openstack_identity_user_v3" "ed" {
+  domain_id                             = openstack_identity_project_v3.engineering-domain.id
+  default_project_id                    = openstack_identity_project_v3.development-project.id
+  name                                  = "Ed"
+  password                              = "Ed"
+  ignore_change_password_upon_first_use = true
+  multi_factor_auth_enabled             = false
+}
+
+# --- Groups ------------------------------------------------------------------
+
+resource "openstack_identity_group_v3" "domain-admins-group" {
+  name        = "Domain Admins"
+  description = "Domain Admins group"
+  domain_id   = openstack_identity_project_v3.engineering-domain.id
+}
+
+resource "openstack_identity_group_v3" "admins-group" {
+  name        = "Admins"
+  description = "Admins group"
+  domain_id   = openstack_identity_project_v3.engineering-domain.id
+}
+
+resource "openstack_identity_group_v3" "devops-group" {
+  name        = "DevOps"
+  description = "DevOps group"
+  domain_id   = openstack_identity_project_v3.engineering-domain.id
+}
+
+resource "openstack_identity_group_v3" "developers-group" {
+  name        = "Developers"
+  description = "Developers group"
+  domain_id   = openstack_identity_project_v3.engineering-domain.id
+}
+
+# --- User Memberships -------------------------------------------------------
+
+resource "openstack_identity_user_membership_v3" "alice-domain-admins" {
+  user_id  = openstack_identity_user_v3.alice.id
+  group_id = openstack_identity_group_v3.domain-admins-group.id
+}
+
+resource "openstack_identity_user_membership_v3" "alice-admins" {
+  user_id  = openstack_identity_user_v3.alice.id
+  group_id = openstack_identity_group_v3.admins-group.id
+}
+
+resource "openstack_identity_user_membership_v3" "bob-devops" {
+  user_id  = openstack_identity_user_v3.bob.id
+  group_id = openstack_identity_group_v3.devops-group.id
+}
+
+resource "openstack_identity_user_membership_v3" "cindy-devops" {
+  user_id  = openstack_identity_user_v3.cindy.id
+  group_id = openstack_identity_group_v3.devops-group.id
+}
+
+resource "openstack_identity_user_membership_v3" "dave-developers" {
+  user_id  = openstack_identity_user_v3.dave.id
+  group_id = openstack_identity_group_v3.developers-group.id
+}
+
+resource "openstack_identity_user_membership_v3" "ed-developers" {
+  user_id  = openstack_identity_user_v3.ed.id
+  group_id = openstack_identity_group_v3.developers-group.id
+}
+
+# --- Roles (data sources) ---------------------------------------------------
+
+data "openstack_identity_role_v3" "admin-role" {
+  name = "Admin"
+}
+
+data "openstack_identity_role_v3" "member-role" {
+  name = "member"
+}
+
+data "openstack_identity_role_v3" "reader-role" {
+  name = "reader"
+}
+
+%{ if enable_loadbalancer ~}
+data "openstack_identity_role_v3" "load-balancer-admin-role" {
+  name = "load-balancer_admin"
+}
+%{ endif ~}
+
+# --- Role Assignments --------------------------------------------------------
+
+# Engineering domain
+resource "openstack_identity_role_assignment_v3" "engineering-domain-admins-admin" {
+  domain_id = openstack_identity_project_v3.engineering-domain.id
+  group_id  = openstack_identity_group_v3.domain-admins-group.id
+  role_id   = data.openstack_identity_role_v3.admin-role.id
+}
+
+# Production project
+resource "openstack_identity_role_assignment_v3" "production-admins-admin" {
+  project_id = openstack_identity_project_v3.production-project.id
+  group_id   = openstack_identity_group_v3.admins-group.id
+  role_id    = data.openstack_identity_role_v3.admin-role.id
+}
+
+%{ if enable_loadbalancer ~}
+resource "openstack_identity_role_assignment_v3" "production-admins-load-balancer-admin" {
+  project_id = openstack_identity_project_v3.production-project.id
+  group_id   = openstack_identity_group_v3.admins-group.id
+  role_id    = data.openstack_identity_role_v3.load-balancer-admin-role.id
+}
+%{ endif ~}
+
+resource "openstack_identity_role_assignment_v3" "production-devops-member" {
+  project_id = openstack_identity_project_v3.production-project.id
+  group_id   = openstack_identity_group_v3.devops-group.id
+  role_id    = data.openstack_identity_role_v3.member-role.id
+}
+
+# Staging project
+resource "openstack_identity_role_assignment_v3" "staging-admins-admin" {
+  project_id = openstack_identity_project_v3.staging-project.id
+  group_id   = openstack_identity_group_v3.admins-group.id
+  role_id    = data.openstack_identity_role_v3.admin-role.id
+}
+
+resource "openstack_identity_role_assignment_v3" "staging-devops-member" {
+  project_id = openstack_identity_project_v3.staging-project.id
+  group_id   = openstack_identity_group_v3.devops-group.id
+  role_id    = data.openstack_identity_role_v3.member-role.id
+}
+
+resource "openstack_identity_role_assignment_v3" "staging-developers-reader" {
+  project_id = openstack_identity_project_v3.staging-project.id
+  group_id   = openstack_identity_group_v3.developers-group.id
+  role_id    = data.openstack_identity_role_v3.reader-role.id
+}
+
+# Development project
+resource "openstack_identity_role_assignment_v3" "development-admins-admin" {
+  project_id = openstack_identity_project_v3.development-project.id
+  group_id   = openstack_identity_group_v3.admins-group.id
+  role_id    = data.openstack_identity_role_v3.admin-role.id
+}
+
+resource "openstack_identity_role_assignment_v3" "development-devops-reader" {
+  project_id = openstack_identity_project_v3.development-project.id
+  group_id   = openstack_identity_group_v3.devops-group.id
+  role_id    = data.openstack_identity_role_v3.reader-role.id
+}
+
+resource "openstack_identity_role_assignment_v3" "development-developers-member" {
+  project_id = openstack_identity_project_v3.development-project.id
+  group_id   = openstack_identity_group_v3.developers-group.id
+  role_id    = data.openstack_identity_role_v3.member-role.id
+}
+
+# =============================================================================
+# ALICE PROVIDER — for resources scoped to Production project
+# =============================================================================
+
+provider "openstack" {
+  alias       = "alice"
+  user_name   = openstack_identity_user_v3.alice.name
+  password    = "Alice"
+  tenant_name = openstack_identity_project_v3.production-project.name
+  domain_name = openstack_identity_project_v3.engineering-domain.name
+
+  project_domain_name = openstack_identity_project_v3.engineering-domain.name
+  user_domain_name    = openstack_identity_project_v3.engineering-domain.name
+
+  auth_url = var.auth_url
+  region   = var.region
+  insecure = var.insecure
+}
+
+# =============================================================================
+# NETWORKING
+# =============================================================================
+
+# --- Provider Network (created by Sunbeam demo-setup) ------------------------
+
+data "openstack_networking_network_v2" "ext-net" {
+  name = "external-network"
+}
+
+# --- Project Networks --------------------------------------------------------
+
+resource "openstack_networking_network_v2" "frontend-network" {
+  name           = "Frontend"
+  admin_state_up = "true"
+  tenant_id      = openstack_identity_project_v3.production-project.id
+}
+
+resource "openstack_networking_subnet_v2" "frontend-subnet" {
+  network_id = openstack_networking_network_v2.frontend-network.id
+  cidr       = "192.168.10.0/24"
+  allocation_pool {
+    start = "192.168.10.10"
+    end   = "192.168.10.254"
+  }
+  tenant_id = openstack_identity_project_v3.production-project.id
+}
+
+resource "openstack_networking_subnet_route_v2" "frontend-subnet-route" {
+  subnet_id        = openstack_networking_subnet_v2.frontend-subnet.id
+  destination_cidr = "192.168.20.0/24"
+  next_hop         = "192.168.10.2"
+}
+
+# Port used as the interface to the Internal Router
+resource "openstack_networking_port_v2" "frontend-port" {
+  name           = "frontend-port"
+  network_id     = openstack_networking_network_v2.frontend-network.id
+  admin_state_up = "true"
+  fixed_ip {
+    subnet_id  = openstack_networking_subnet_v2.frontend-subnet.id
+    ip_address = "192.168.10.2"
+  }
+}
+
+resource "openstack_networking_network_v2" "backend-network" {
+  name           = "Backend"
+  admin_state_up = "true"
+  tenant_id      = openstack_identity_project_v3.production-project.id
+}
+
+resource "openstack_networking_subnet_v2" "backend-subnet" {
+  network_id = openstack_networking_network_v2.backend-network.id
+  cidr       = "192.168.20.0/24"
+  allocation_pool {
+    start = "192.168.20.10"
+    end   = "192.168.20.254"
+  }
+  tenant_id = openstack_identity_project_v3.production-project.id
+}
+
+# --- Internal Router (connects Frontend <-> Backend) -------------------------
+
+resource "openstack_networking_router_v2" "internal-router" {
+  name           = "Internal Router"
+  admin_state_up = true
+  tenant_id      = openstack_identity_project_v3.production-project.id
+}
+
+resource "openstack_networking_router_interface_v2" "internal-router-frontend-interface" {
+  router_id = openstack_networking_router_v2.internal-router.id
+  port_id   = openstack_networking_port_v2.frontend-port.id
+}
+
+resource "openstack_networking_router_interface_v2" "internal-router-backend-interface" {
+  router_id = openstack_networking_router_v2.internal-router.id
+  subnet_id = openstack_networking_subnet_v2.backend-subnet.id
+}
+
+# --- External Router (gateway to provider network) ---------------------------
+
+resource "openstack_networking_router_v2" "ext-net-router" {
+  name                = "External Router"
+  admin_state_up      = true
+  external_network_id = data.openstack_networking_network_v2.ext-net.id
+  tenant_id           = openstack_identity_project_v3.production-project.id
+}
+
+resource "openstack_networking_router_interface_v2" "ext-net-router-frontend-interface" {
+  router_id = openstack_networking_router_v2.ext-net-router.id
+  subnet_id = openstack_networking_subnet_v2.frontend-subnet.id
+}
+
+# --- Security Groups ---------------------------------------------------------
+
+resource "openstack_networking_secgroup_v2" "jumphost-servers-secgroup" {
+  name        = "Jumphost servers"
+  description = "Security group allowing traffic to Jumphost servers"
+  tenant_id   = openstack_identity_project_v3.production-project.id
+}
+
+resource "openstack_networking_secgroup_v2" "backend-servers-secgroup" {
+  name        = "Backend servers"
+  description = "Security group allowing traffic to Backend servers"
+  tenant_id   = openstack_identity_project_v3.production-project.id
+}
+
+resource "openstack_networking_secgroup_v2" "frontend-servers-secgroup" {
+  name        = "Frontend servers"
+  description = "Security group allowing traffic to Frontend servers"
+  tenant_id   = openstack_identity_project_v3.production-project.id
+}
+
+# --- Security Group Rules ----------------------------------------------------
+
+# Jumphost: SSH from anywhere
+resource "openstack_networking_secgroup_rule_v2" "jumphost-servers-secgroup-rule" {
+  direction         = "ingress"
+  ethertype         = "IPv4"
+  protocol          = "tcp"
+  port_range_min    = 22
+  port_range_max    = 22
+  remote_ip_prefix  = "0.0.0.0/0"
+  security_group_id = openstack_networking_secgroup_v2.jumphost-servers-secgroup.id
+}
+
+# Frontend: HTTP from anywhere
+resource "openstack_networking_secgroup_rule_v2" "frontend-servers-secgroup-rule-1" {
+  direction         = "ingress"
+  ethertype         = "IPv4"
+  protocol          = "tcp"
+  port_range_min    = 80
+  port_range_max    = 80
+  remote_ip_prefix  = "0.0.0.0/0"
+  security_group_id = openstack_networking_secgroup_v2.frontend-servers-secgroup.id
+}
+
+# Frontend: SSH from jumphost only
+resource "openstack_networking_secgroup_rule_v2" "frontend-servers-secgroup-rule-2" {
+  direction         = "ingress"
+  ethertype         = "IPv4"
+  protocol          = "tcp"
+  port_range_min    = 22
+  port_range_max    = 22
+  security_group_id = openstack_networking_secgroup_v2.frontend-servers-secgroup.id
+  remote_group_id   = openstack_networking_secgroup_v2.jumphost-servers-secgroup.id
+}
+
+# Backend: all traffic from frontend servers only
+resource "openstack_networking_secgroup_rule_v2" "backend-servers-secgroup-rule" {
+  security_group_id = openstack_networking_secgroup_v2.backend-servers-secgroup.id
+  direction         = "ingress"
+  ethertype         = "IPv4"
+  remote_group_id   = openstack_networking_secgroup_v2.frontend-servers-secgroup.id
+}
+
+# =============================================================================
+# COMPUTE
+# =============================================================================
+
+# --- Availability Zones (admin provider) -------------------------------------
+
+%{ for i, hostname in all_hostnames ~}
+resource "openstack_compute_aggregate_v2" "az-${i + 1}" {
+  name = "az-${i + 1}"
+  zone = "az-${i + 1}"
+  hosts = [
+    "${hostname}",
+  ]
+}
+
+%{ endfor ~}
+# --- Server Groups -----------------------------------------------------------
+
+resource "openstack_compute_servergroup_v2" "frontend-servers" {
+  provider = openstack.alice
+  name     = "Frontend Servers"
+  policies = ["soft-anti-affinity"]
+}
+
+resource "openstack_compute_servergroup_v2" "backend-servers" {
+  provider = openstack.alice
+  name     = "Backend Servers"
+  policies = ["soft-anti-affinity"]
+}
+
+# --- Key Pair ----------------------------------------------------------------
+
+resource "openstack_compute_keypair_v2" "alice-keypair" {
+  name       = "alice-keypair"
+  user_id    = openstack_identity_user_v3.alice.id
+  public_key = var.ssh_public_key
+}
+
+# --- Images (reuse Sunbeam's existing ubuntu image) --------------------------
+
+data "openstack_images_image_v2" "ubuntu" {
+  name        = "ubuntu"
+  most_recent = true
+}
+
+# --- Servers -----------------------------------------------------------------
+
+# Jumphost — entry point with floating IP
+resource "openstack_compute_instance_v2" "jumphost" {
+  provider = openstack.alice
+
+  name        = "jumphost"
+  image_id    = data.openstack_images_image_v2.ubuntu.id
+  flavor_name = "m1.tiny"
+  key_pair    = openstack_compute_keypair_v2.alice-keypair.name
+
+  security_groups = [openstack_networking_secgroup_v2.jumphost-servers-secgroup.name]
+
+  scheduler_hints {
+    group = openstack_compute_servergroup_v2.frontend-servers.id
+  }
+
+  network {
+    name = openstack_networking_network_v2.frontend-network.name
+  }
+
+  depends_on = [
+    openstack_networking_router_interface_v2.ext-net-router-frontend-interface,
+    openstack_identity_role_assignment_v3.production-admins-admin,
+  ]
+}
+
+# Web-1 — frontend server with Apache
+resource "openstack_compute_instance_v2" "web-1" {
+  provider = openstack.alice
+
+  name        = "web-1"
+  image_id    = data.openstack_images_image_v2.ubuntu.id
+  flavor_name = "m1.tiny"
+  key_pair    = openstack_compute_keypair_v2.alice-keypair.name
+
+  security_groups = [openstack_networking_secgroup_v2.frontend-servers-secgroup.name]
+
+%{ if enable_shared_filesystem ~}
+  # cloud-init: install Apache + mount NFS share
+  # NOTE: NFS mount path is populated after share creation via depends_on;
+  # we use a simple runcmd approach since export_locations is only known at apply time
+  user_data = <<-EOT
+    #cloud-config
+    packages:
+      - apache2
+      - nfs-common
+    runcmd:
+      - [sh, -xc, "echo 'hello from web-1!' > /var/www/html/index.html"]
+  EOT
+%{ else ~}
+  user_data = <<-EOT
+    #cloud-config
+    packages:
+      - apache2
+    runcmd:
+      - [sh, -xc, "echo 'hello from web-1!' > /var/www/html/index.html"]
+  EOT
+%{ endif ~}
+
+  scheduler_hints {
+    group = openstack_compute_servergroup_v2.frontend-servers.id
+  }
+
+  network {
+    name = openstack_networking_network_v2.frontend-network.name
+  }
+
+  depends_on = [
+    openstack_networking_router_interface_v2.ext-net-router-frontend-interface,
+    openstack_identity_role_assignment_v3.production-admins-admin,
+  ]
+}
+
+# DB-1 — backend server with volume
+resource "openstack_compute_instance_v2" "db-1" {
+  provider = openstack.alice
+
+  name        = "db-1"
+  image_id    = data.openstack_images_image_v2.ubuntu.id
+  flavor_name = "m1.tiny"
+  key_pair    = openstack_compute_keypair_v2.alice-keypair.name
+
+  security_groups = [openstack_networking_secgroup_v2.backend-servers-secgroup.name]
+
+  scheduler_hints {
+    group = openstack_compute_servergroup_v2.backend-servers.id
+  }
+
+  network {
+    name = openstack_networking_network_v2.backend-network.name
+  }
+
+  depends_on = [
+    openstack_networking_router_interface_v2.internal-router-backend-interface,
+    openstack_identity_role_assignment_v3.production-admins-admin,
+  ]
+}
+
+# --- Floating IP for Jumphost ------------------------------------------------
+
+resource "openstack_networking_floatingip_v2" "jumphost-floating-ip" {
+  provider = openstack.alice
+  pool     = data.openstack_networking_network_v2.ext-net.name
+}
+
+resource "openstack_networking_floatingip_associate_v2" "jumphost-floating-ip-associate" {
+  floating_ip = openstack_networking_floatingip_v2.jumphost-floating-ip.address
+  port_id     = openstack_compute_instance_v2.jumphost.network.0.port
+}
+
+# =============================================================================
+# BLOCK STORAGE
+# =============================================================================
+
+resource "openstack_blockstorage_volume_v3" "db-1-volume" {
+  provider = openstack.alice
+  name     = "db-1-volume"
+  size     = 1
+}
+
+resource "openstack_compute_volume_attach_v2" "db-1-volume-attachment" {
+  instance_id = openstack_compute_instance_v2.db-1.id
+  volume_id   = openstack_blockstorage_volume_v3.db-1-volume.id
+}
+
+# =============================================================================
+# SHARED FILESYSTEM (Manila) — conditional
+# =============================================================================
+
+%{ if enable_shared_filesystem ~}
+resource "openstack_sharedfilesystem_share_v2" "web-share" {
+  provider    = openstack.alice
+  name        = "DB Share"
+  description = "File system shared by frontend servers"
+  share_proto = "NFS"
+  size        = 1
+}
+
+resource "openstack_sharedfilesystem_share_access_v2" "web-1-share-access" {
+  share_id     = openstack_sharedfilesystem_share_v2.web-share.id
+  access_type  = "ip"
+  access_to    = "0.0.0.0/0"
+  access_level = "rw"
+}
+%{ endif ~}
+
+# =============================================================================
+# LOAD BALANCER (Octavia) — conditional
+# =============================================================================
+
+%{ if enable_loadbalancer ~}
+resource "openstack_lb_loadbalancer_v2" "web-loadbalancer" {
+  provider      = openstack.alice
+  name          = "Web"
+  vip_subnet_id = openstack_networking_subnet_v2.frontend-subnet.id
+}
+
+resource "openstack_lb_listener_v2" "web-listener" {
+  provider        = openstack.alice
+  name            = "Web HTTP Listener"
+  protocol        = "HTTP"
+  protocol_port   = 80
+  loadbalancer_id = openstack_lb_loadbalancer_v2.web-loadbalancer.id
+
+  insert_headers = {
+    X-Forwarded-For = "true"
+  }
+}
+
+resource "openstack_lb_pool_v2" "web-pool" {
+  provider    = openstack.alice
+  name        = "Web Pool"
+  protocol    = "HTTP"
+  lb_method   = "ROUND_ROBIN"
+  listener_id = openstack_lb_listener_v2.web-listener.id
+}
+
+resource "openstack_lb_monitor_v2" "web-1-monitor" {
+  provider    = openstack.alice
+  name        = "Web Health Monitor"
+  pool_id     = openstack_lb_pool_v2.web-pool.id
+  type        = "HTTP"
+  delay       = 20
+  timeout     = 10
+  max_retries = 5
+}
+
+resource "openstack_lb_member_v2" "web-1-member" {
+  provider      = openstack.alice
+  address       = openstack_compute_instance_v2.web-1.access_ip_v4
+  protocol_port = 80
+  pool_id       = openstack_lb_pool_v2.web-pool.id
+  subnet_id     = openstack_networking_subnet_v2.frontend-subnet.id
+}
+
+# Floating IP for Load Balancer VIP
+resource "openstack_networking_floatingip_v2" "web-loadbalancer-floating-ip" {
+  provider = openstack.alice
+  pool     = data.openstack_networking_network_v2.ext-net.name
+}
+
+resource "openstack_networking_floatingip_associate_v2" "web-loadbalancer-floating-ip-associate" {
+  floating_ip = openstack_networking_floatingip_v2.web-loadbalancer-floating-ip.address
+  port_id     = openstack_lb_loadbalancer_v2.web-loadbalancer.vip_port_id
+}
+%{ endif ~}
+
+# =============================================================================
+# DNS (Designate) — conditional
+# =============================================================================
+
+%{ if enable_dns ~}
+resource "openstack_dns_zone_v2" "example-zone" {
+  provider    = openstack.alice
+  name        = "example.com."
+  email       = "jdoe@example.com"
+  description = "An example zone"
+  ttl         = 3000
+  type        = "PRIMARY"
+}
+
+%{ if enable_loadbalancer ~}
+# DNS record pointing to LB floating IP
+resource "openstack_dns_recordset_v2" "recordset-example-zone" {
+  provider    = openstack.alice
+  zone_id     = openstack_dns_zone_v2.example-zone.id
+  name        = "www.example.com."
+  description = "DNS A record pointing to Web Loadbalancer"
+  ttl         = 3000
+  type        = "A"
+  records = [
+    openstack_networking_floatingip_v2.web-loadbalancer-floating-ip.address,
+  ]
+}
+%{ else ~}
+# DNS record pointing to jumphost floating IP (no LB available)
+resource "openstack_dns_recordset_v2" "recordset-example-zone" {
+  provider    = openstack.alice
+  zone_id     = openstack_dns_zone_v2.example-zone.id
+  name        = "www.example.com."
+  description = "DNS A record pointing to Jumphost"
+  ttl         = 3000
+  type        = "A"
+  records = [
+    openstack_networking_floatingip_v2.jumphost-floating-ip.address,
+  ]
+}
+%{ endif ~}
+%{ endif ~}
+
+# =============================================================================
+# OBJECT STORAGE (Swift/RadosGW)
+# =============================================================================
+
+resource "openstack_objectstorage_container_v1" "container" {
+  provider       = openstack.alice
+  name           = "container-1"
+  container_read = ".r:*,.rlistings"
+}
+
+resource "openstack_objectstorage_object_v1" "object" {
+  provider       = openstack.alice
+  count          = 10
+  container_name = openstack_objectstorage_container_v1.container.name
+  name           = "test-$${count.index}.json"
+
+  content_type = "application/json"
+  content      = <<-JSON
+    {
+      "foo" : "bar"
+    }
+  JSON
+}
+
+# =============================================================================
+# OUTPUTS
+# =============================================================================
+
+output "jumphost_floating_ip" {
+  description = "Floating IP assigned to the jumphost"
+  value       = openstack_networking_floatingip_v2.jumphost-floating-ip.address
+}
+
+%{ if enable_loadbalancer ~}
+output "loadbalancer_floating_ip" {
+  description = "Floating IP assigned to the Web load balancer"
+  value       = openstack_networking_floatingip_v2.web-loadbalancer-floating-ip.address
+}
+%{ endif ~}
+
+output "alice_credentials" {
+  description = "Login credentials for Alice (demo user)"
+  value       = "User: Alice, Password: Alice, Domain: Engineering, Project: Production"
+}

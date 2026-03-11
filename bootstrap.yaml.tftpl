@@ -159,6 +159,15 @@ write_files:
     content: |
       ${indent(6, ssh_private_key)}
 
+%{ if enable_demo_env ~}
+  # --- Demo environment Terraform config (rendered by outer GCP Terraform) ---
+  - path: /opt/sunbeam/demo-env/main.tf
+    permissions: "0644"
+    owner: root:root
+    content: |
+      ${indent(6, demo_terraform_config)}
+%{ endif ~}
+
   # --- Sunbeam manifest (lists ALL nodes) ---
   - path: /opt/sunbeam/manifest.yaml
     permissions: "0644"
@@ -335,6 +344,73 @@ write_files:
               -d '{"key":"sunbeam_bootstrapped","value":"\"True\""}' \
               http://localhost/1.0/config/sunbeam_bootstrapped 2>/dev/null || true
           echo "sunbeam_bootstrapped flag set"
+      }
+
+      # Helper: generate an admin openrc file from Sunbeam's Keystone credentials.
+      # Returns the path to the generated file.
+      generate_admin_openrc() {
+          local ADMIN_RC="/home/ubuntu/admin-openrc"
+          if [ -f "$ADMIN_RC" ]; then
+              echo "$ADMIN_RC"
+              return 0
+          fi
+
+          # Extract admin password from Keystone leader
+          local ADMIN_PASS=""
+          for attempt in $(seq 1 5); do
+              ADMIN_PASS=$(run_snap_cmd "juju run -m openstack keystone/leader get-admin-account 2>/dev/null" \
+                  | grep "^password:" | awk '{print $2}') || true
+              if [ -n "$ADMIN_PASS" ]; then
+                  break
+              fi
+              echo "  [$attempt/5] Waiting for admin password from Keystone..." >&2
+              sleep 15
+          done
+
+          if [ -z "$ADMIN_PASS" ]; then
+              echo "ERROR: Could not retrieve admin password from Keystone" >&2
+              return 1
+          fi
+
+          # Get the Keystone endpoint URL (from traefik-public VIP)
+          local KEYSTONE_URL=""
+          for attempt in $(seq 1 5); do
+              KEYSTONE_URL=$(run_snap_cmd "juju run -m openstack traefik-public/leader show-proxied-endpoints 2>/dev/null" \
+                  | python3 -c "
+import sys, json, yaml
+data = yaml.safe_load(sys.stdin.read())
+for key, val in data.items():
+    if key == 'proxied-endpoints':
+        endpoints = json.loads(val)
+        if 'keystone' in endpoints:
+            print(endpoints['keystone']['url'])
+            break
+" 2>/dev/null) || true
+              if [ -n "$KEYSTONE_URL" ]; then
+                  break
+              fi
+              echo "  [$attempt/5] Waiting for Keystone endpoint URL..." >&2
+              sleep 15
+          done
+
+          if [ -z "$KEYSTONE_URL" ]; then
+              echo "ERROR: Could not retrieve Keystone URL" >&2
+              return 1
+          fi
+
+          cat > "$ADMIN_RC" <<ADMIN_EOF
+      export OS_AUTH_URL=$KEYSTONE_URL
+      export OS_USERNAME=admin
+      export OS_PASSWORD=$ADMIN_PASS
+      export OS_USER_DOMAIN_NAME=admin_domain
+      export OS_PROJECT_DOMAIN_NAME=admin_domain
+      export OS_PROJECT_NAME=admin
+      export OS_AUTH_TYPE=password
+      export OS_IDENTITY_API_VERSION=3
+      export OS_REGION_NAME=RegionOne
+      ADMIN_EOF
+          chmod 600 "$ADMIN_RC"
+          echo "$ADMIN_RC"
       }
 
       # ---------------------------------------------------------------
@@ -782,6 +858,54 @@ write_files:
 %{ endif ~}
 
       # ---------------------------------------------------------------
+      # Phase 06c: Enable Shared Filesystem (Manila) (optional)
+      #
+      # Manila uses CephFS NFS backend in Sunbeam. This is an
+      # experimental feature gated behind a snap config flag.
+      # Steps:
+      #   1. Unlock the feature gate
+      #   2. Enable the feature via sunbeam CLI
+      #   3. Create the CephFS NFS share type (required for demos)
+      # ---------------------------------------------------------------
+%{ if enable_shared_filesystem ~}
+      enable_shared_filesystem() {
+          echo "Unlocking shared-filesystem feature gate..."
+          sudo snap set openstack feature.shared-filesystem=true
+
+          echo "Enabling shared-filesystem (Manila)..."
+          retry 3 120 run_snap_cmd "sunbeam enable shared-filesystem"
+
+          # Create the CephFS NFS share type — required before any shares can be created.
+          # Uses admin credentials from the Sunbeam-generated admin openrc.
+          echo "Creating CephFS NFS share type..."
+          local ADMIN_RC
+          ADMIN_RC=$(generate_admin_openrc)
+          run_snap_cmd "source $ADMIN_RC && manila type-create cephfsnfstype false" 2>/dev/null || true
+          run_snap_cmd "source $ADMIN_RC && manila type-key cephfsnfstype set vendor_name=Ceph storage_protocol=NFS" 2>/dev/null || true
+          echo "Share type 'cephfsnfstype' created"
+      }
+      run_phase "06c-enable-shared-filesystem" enable_shared_filesystem
+%{ else ~}
+      echo "=== Shared Filesystem skipped (enable_shared_filesystem=false) ==="
+%{ endif ~}
+
+      # ---------------------------------------------------------------
+      # Phase 06d: Enable Load Balancer (Octavia) (optional)
+      #
+      # Octavia uses OVN provider driver in Sunbeam (no Amphora VMs).
+      # Users need the 'load-balancer_member' role to create LBs.
+      # The demo environment Terraform handles role assignment.
+      # ---------------------------------------------------------------
+%{ if enable_loadbalancer ~}
+      enable_loadbalancer() {
+          retry 3 120 run_snap_cmd "sunbeam enable loadbalancer"
+      }
+      run_phase "06d-enable-loadbalancer" enable_loadbalancer
+%{ else ~}
+      echo "=== Load Balancer skipped (enable_loadbalancer=false) ==="
+%{ endif ~}
+
+      # ---------------------------------------------------------------
       # Phase 07: Enable DNS (Designate) (optional)
       # ---------------------------------------------------------------
 %{ if enable_dns ~}
@@ -1012,6 +1136,83 @@ write_files:
               openstack server show test-vm-tenant"
       }
       run_phase "14-test-vm" launch_test_vm
+
+      # ---------------------------------------------------------------
+      # Phase 15: Deploy demo environment via OpenStack Terraform
+      #
+      # Uses the rendered demo-openstack.tf (written by cloud-init) to
+      # create a full demo environment: domains, projects, users, VMs,
+      # networks, LB, DNS, volumes, shares, object storage.
+      #
+      # Terraform is available at /snap/openstack/current/bin/terraform
+      # (bundled with the Sunbeam snap — no extra installation needed).
+      # ---------------------------------------------------------------
+%{ if enable_demo_env ~}
+      deploy_demo_env() {
+          local DEMO_DIR="/opt/sunbeam/demo-env"
+          local TF_BIN="/snap/openstack/current/bin/terraform"
+
+          if [ ! -f "$DEMO_DIR/main.tf" ]; then
+              echo "ERROR: Demo Terraform config not found at $DEMO_DIR/main.tf"
+              return 1
+          fi
+
+          # Generate admin openrc and extract credentials
+          local ADMIN_RC
+          ADMIN_RC=$(generate_admin_openrc)
+          if [ $? -ne 0 ] || [ ! -f "$ADMIN_RC" ]; then
+              echo "ERROR: Could not generate admin openrc"
+              return 1
+          fi
+
+          source "$ADMIN_RC"
+          echo "Admin credentials loaded (auth_url=$OS_AUTH_URL)"
+
+          # Get SSH public key for Alice's keypair
+          local SSH_PUBKEY=""
+          if [ -f /home/ubuntu/.ssh/id_rsa.pub ]; then
+              SSH_PUBKEY=$(cat /home/ubuntu/.ssh/id_rsa.pub)
+          elif [ -f /opt/sunbeam/sunbeam-key.pub ]; then
+              SSH_PUBKEY=$(cat /opt/sunbeam/sunbeam-key.pub)
+          else
+              # Generate a keypair for Alice
+              ssh-keygen -t rsa -b 2048 -N "" -f /opt/sunbeam/alice-key -C "alice@demo" 2>/dev/null || true
+              SSH_PUBKEY=$(cat /opt/sunbeam/alice-key.pub 2>/dev/null || echo "")
+          fi
+
+          if [ -z "$SSH_PUBKEY" ]; then
+              echo "WARNING: No SSH public key found — generating one"
+              ssh-keygen -t rsa -b 2048 -N "" -f /opt/sunbeam/alice-key -C "alice@demo"
+              SSH_PUBKEY=$(cat /opt/sunbeam/alice-key.pub)
+          fi
+
+          # Write terraform.tfvars
+          cat > "$DEMO_DIR/terraform.tfvars" <<TFVARS_EOF
+      auth_url             = "$OS_AUTH_URL"
+      cloud_admin_password = "$OS_PASSWORD"
+      cloud_admin_name     = "$OS_USERNAME"
+      cloud_admin_project  = "$OS_PROJECT_NAME"
+      cloud_admin_domain   = "$OS_USER_DOMAIN_NAME"
+      region               = "$OS_REGION_NAME"
+      insecure             = true
+      ssh_public_key       = "$SSH_PUBKEY"
+      TFVARS_EOF
+
+          # Initialize and apply
+          echo "Running terraform init..."
+          retry 3 30 $TF_BIN -chdir="$DEMO_DIR" init -input=false
+
+          echo "Running terraform apply..."
+          # Demo resources take ~5-10 min to create (VMs need to boot, LB needs to provision)
+          retry 2 60 $TF_BIN -chdir="$DEMO_DIR" apply -auto-approve -input=false
+
+          echo "=== Demo environment deployed ==="
+          $TF_BIN -chdir="$DEMO_DIR" output 2>/dev/null || true
+      }
+      run_phase "15-deploy-demo-env" deploy_demo_env
+%{ else ~}
+      echo "=== Demo environment skipped (enable_demo_env=false) ==="
+%{ endif ~}
 
       # ---------------------------------------------------------------
       # Done — mark complete

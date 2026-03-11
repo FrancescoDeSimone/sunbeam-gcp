@@ -177,6 +177,24 @@ variable "enable_observability" {
   default     = true
 }
 
+variable "enable_shared_filesystem" {
+  description = "Enable Shared Filesystem (Manila with CephFS NFS backend). Adds ~10-15 min. Experimental feature gate."
+  type        = bool
+  default     = true
+}
+
+variable "enable_loadbalancer" {
+  description = "Enable Load Balancer (Octavia with OVN provider driver). Adds ~10-15 min."
+  type        = bool
+  default     = true
+}
+
+variable "enable_demo_env" {
+  description = "Deploy a full demo environment (domains, projects, users, VMs, networks, LB, DNS zones, volumes, shares, object storage) using OpenStack Terraform provider on node-1. Adds ~10-15 min after all features are enabled."
+  type        = bool
+  default     = true
+}
+
 # -----------------------------------------------------------------------------
 # LOCALS — Derived values used across resources
 # -----------------------------------------------------------------------------
@@ -443,6 +461,15 @@ resource "google_compute_instance" "sunbeam_node" {
       enable_dns                   = var.enable_dns
       enable_resource_optimization = var.enable_resource_optimization
       enable_observability         = var.enable_observability
+      enable_shared_filesystem     = var.enable_shared_filesystem
+      enable_loadbalancer          = var.enable_loadbalancer
+      enable_demo_env              = var.enable_demo_env
+      demo_terraform_config = var.enable_demo_env ? templatefile("${path.module}/demo-openstack.tf.tftpl", {
+        enable_shared_filesystem = var.enable_shared_filesystem
+        enable_loadbalancer      = var.enable_loadbalancer
+        enable_dns               = var.enable_dns
+        all_hostnames            = local.all_hostnames
+      }) : ""
       }) : templatefile("${path.module}/join.yaml.tftpl", {
       provider_nic         = "ens5"
       provider_cidr        = google_compute_subnetwork.sunbeam_external.ip_cidr_range
