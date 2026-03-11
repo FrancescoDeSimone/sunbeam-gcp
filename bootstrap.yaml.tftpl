@@ -880,8 +880,8 @@ for key, val in data.items():
           echo "Creating CephFS NFS share type..."
           local ADMIN_RC
           ADMIN_RC=$(generate_admin_openrc)
-          run_snap_cmd "source $ADMIN_RC && manila type-create cephfsnfstype false" 2>/dev/null || true
-          run_snap_cmd "source $ADMIN_RC && manila type-key cephfsnfstype set vendor_name=Ceph storage_protocol=NFS" 2>/dev/null || true
+          run_snap_cmd "source $ADMIN_RC && openstack share type create cephfsnfstype false"
+          run_snap_cmd "source $ADMIN_RC && openstack share type set cephfsnfstype --extra-specs vendor_name=Ceph storage_protocol=NFS"
           echo "Share type 'cephfsnfstype' created"
       }
       run_phase "06c-enable-shared-filesystem" enable_shared_filesystem

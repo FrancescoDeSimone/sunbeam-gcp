@@ -206,6 +206,12 @@ locals {
     "sunbeam-node-${i + 1}.cluster.local"
   ]
 
+  # Nova compute-service hostnames use the GCP internal FQDN format
+  compute_hostnames = [
+    for i in range(var.node_count) :
+    "sunbeam-node-${i + 1}.c.${var.project_id}.internal"
+  ]
+
   # Deterministic control-plane IPs — reserved via google_compute_address
   # so we know them at plan time (before instances are created).
   # GCP DHCP does NOT assign IPs sequentially — we MUST reserve them.
@@ -468,7 +474,7 @@ resource "google_compute_instance" "sunbeam_node" {
         enable_shared_filesystem = var.enable_shared_filesystem
         enable_loadbalancer      = var.enable_loadbalancer
         enable_dns               = var.enable_dns
-        all_hostnames            = local.all_hostnames
+        all_hostnames            = local.compute_hostnames
       }) : ""
       }) : templatefile("${path.module}/join.yaml.tftpl", {
       provider_nic         = "ens5"
