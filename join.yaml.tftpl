@@ -1,0 +1,391 @@
+#cloud-config
+# =============================================================================
+# cloud-init for Sunbeam JOIN nodes (nodes 2+)
+#
+# Strategy:
+#   - Installs snap, prepares node (no --bootstrap), SSH-polls bootstrap
+#     node for join token, joins cluster, signals completion
+#   - Also installs a local GCP networking fix script that the bootstrap
+#     node triggers remotely after OVN is fully configured
+#
+# On Ubuntu 24.04 with GVNIC:
+#   ens4 = nic0 (control plane, DHCP-managed by GCP)
+#   ens5 = nic1 (external/provider — must be unconfigured for OVS)
+# =============================================================================
+
+write_files:
+  # --- Netplan: disable DHCP on ens5 ---
+  - path: /etc/netplan/90-disable-nic1.yaml
+    permissions: "0600"
+    owner: root:root
+    content: |
+      network:
+        version: 2
+        ethernets:
+          ens5:
+            dhcp4: false
+            dhcp6: false
+            accept-ra: false
+            link-local: []
+            optional: true
+
+  # --- sysctl: disable reverse path filtering ---
+  # Required for floating IP traffic forwarding between provider subnet
+  # and FIP CIDR on br-ex
+  - path: /etc/sysctl.d/99-sunbeam-rp-filter.conf
+    permissions: "0644"
+    owner: root:root
+    content: |
+      net.ipv4.conf.all.rp_filter = 0
+      net.ipv4.conf.default.rp_filter = 0
+
+  # --- google-guest-agent: disable network setup ---
+  - path: /etc/default/instance_configs.cfg
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [NetworkInterfaces]
+      ip_forwarding = true
+      dhclient_script = /sbin/google-dhclient-script
+      dhcp_command =
+      setup = false
+
+  # --- systemd: deconfigure ens5 on every boot ---
+  - path: /etc/systemd/system/deconfigure-ens5.service
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Deconfigure ens5 for OVS
+      After=network-online.target google-guest-agent.service
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/bin/bash -c 'rm -f /run/systemd/network/10-netplan-ens5.network.d/override.conf; networkctl reload 2>/dev/null; ip addr flush dev ens5 2>/dev/null; ip link set dev ens5 up 2>/dev/null; sysctl -w net.ipv6.conf.ens5.disable_ipv6=1 2>/dev/null; echo deconfigure-ens5 done'
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # --- systemd: sunbeam join service ---
+  - path: /etc/systemd/system/sunbeam-join.service
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Sunbeam OpenStack Join Cluster
+      After=network-online.target deconfigure-ens5.service
+      Wants=network-online.target deconfigure-ens5.service
+      ConditionPathExists=!/opt/sunbeam/.join-complete
+
+      [Service]
+      Type=oneshot
+      User=ubuntu
+      Group=ubuntu
+      Environment=HOME=/home/ubuntu
+      Environment=USER=ubuntu
+      ExecStart=/opt/sunbeam/join.sh
+      TimeoutStartSec=7200
+      StandardOutput=append:/var/log/sunbeam-join.log
+      StandardError=append:/var/log/sunbeam-join.log
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # --- systemd: reapply GCP networking fixes on reboot ---
+  - path: /etc/systemd/system/reapply-gcp-fixes.service
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Reapply GCP/OVN networking fixes after reboot
+      After=network-online.target openvswitch-switch.service ovn-controller.service deconfigure-ens5.service
+      Wants=network-online.target openvswitch-switch.service
+      ConditionPathExists=/opt/sunbeam/gcp-fix-params.env
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/opt/sunbeam/reapply-gcp-fixes.sh
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # --- reapply GCP fixes script (br-ex MAC + IP only, no flow rules needed with SNAT) ---
+  - path: /opt/sunbeam/reapply-gcp-fixes.sh
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/bin/bash
+      set -euxo pipefail
+      source /opt/sunbeam/gcp-fix-params.env
+      sleep 10
+
+      # Set br-ex MAC to match ens5 (GCP expects traffic from the original NIC MAC)
+      ip link set br-ex address "$ENS5_MAC" 2>/dev/null || true
+      ovs-vsctl set bridge br-ex other-config:hwaddr="$ENS5_MAC" 2>/dev/null || true
+
+      # Restore the GCP-assigned IP on br-ex so OVN can use it for SNAT/floating IPs
+      ip addr add "$GCP_NIC1_IP/$PROVIDER_PREFIX" dev br-ex 2>/dev/null || true
+
+      # Disable reverse path filtering (required for FIP traffic forwarding)
+      sysctl -w net.ipv4.conf.all.rp_filter=0 2>/dev/null || true
+      sysctl -w net.ipv4.conf.ens5.rp_filter=0 2>/dev/null || true
+      sysctl -w net.ipv4.conf.br-ex.rp_filter=0 2>/dev/null || true
+
+      # Add return route for provider subnet via br-ex
+      PROVIDER_SUBNET="${provider_cidr}"
+      FIP_GATEWAY="${fip_gateway}"
+      if ! ip route show "$PROVIDER_SUBNET" dev br-ex 2>/dev/null | grep -q "$PROVIDER_SUBNET"; then
+          ip route add "$PROVIDER_SUBNET" dev br-ex src "$FIP_GATEWAY" 2>/dev/null || true
+      fi
+
+      # Ensure MetalLB VIP route via bootstrap node persists across reboots
+      if ! ip route show 172.16.1.0/24 | grep -q "via ${bootstrap_control_ip}"; then
+          ip route add 172.16.1.0/24 via ${bootstrap_control_ip} dev ens4 || true
+      fi
+
+      echo "GCP networking fixes reapplied (br-ex MAC=$ENS5_MAC, IP=$GCP_NIC1_IP/$PROVIDER_PREFIX)"
+
+  # --- SSH private key for inter-node communication ---
+  - path: /opt/sunbeam/sunbeam-key
+    permissions: "0600"
+    owner: root:root
+    content: |
+      ${indent(6, ssh_private_key)}
+
+  # --- Local GCP networking fix script ---
+  # Called remotely by bootstrap node after OVN is fully configured.
+  # Fixes br-ex MAC, IP, rp_filter, and adds return route for FIP traffic.
+  - path: /opt/sunbeam/fix-gcp-local.sh
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/bin/bash
+      set -euxo pipefail
+
+      PROVIDER_NIC="${provider_nic}"
+      PROVIDER_CIDR="${provider_cidr}"
+      FIP_GATEWAY="${fip_gateway}"
+
+      ENS5_MAC=$(cat /sys/class/net/$PROVIDER_NIC/address)
+      echo "ens5 MAC: $ENS5_MAC"
+
+      GCP_NIC1_IP=$(curl -s -H "Metadata-Flavor: Google" \
+          "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/1/ip" 2>/dev/null)
+      PROVIDER_PREFIX=$(echo "$PROVIDER_CIDR" | cut -d'/' -f2)
+
+      # Fix br-ex MAC to match ens5 (GCP expects traffic from the original NIC MAC)
+      ovs-vsctl set bridge br-ex other-config:hwaddr="$ENS5_MAC"
+      ip link set br-ex address "$ENS5_MAC"
+      ip addr add "$GCP_NIC1_IP/$PROVIDER_PREFIX" dev br-ex 2>/dev/null || true
+
+      # Disable reverse path filtering (required for FIP traffic forwarding)
+      sysctl -w net.ipv4.conf.all.rp_filter=0 2>/dev/null || true
+      sysctl -w net.ipv4.conf.ens5.rp_filter=0 2>/dev/null || true
+      sysctl -w net.ipv4.conf.br-ex.rp_filter=0 2>/dev/null || true
+
+      # Add return route for provider subnet via br-ex
+      if ! ip route show "$PROVIDER_CIDR" dev br-ex 2>/dev/null | grep -q "$PROVIDER_CIDR"; then
+          ip route add "$PROVIDER_CIDR" dev br-ex src "$FIP_GATEWAY" 2>/dev/null || true
+      fi
+
+      # Save for reboot persistence
+      printf '%s\n' \
+          "ENS5_MAC=$ENS5_MAC" \
+          "GCP_NIC1_IP=$GCP_NIC1_IP" \
+          "PROVIDER_PREFIX=$PROVIDER_PREFIX" \
+          "PROVIDER_NIC=$PROVIDER_NIC" \
+          > /opt/sunbeam/gcp-fix-params.env
+
+      echo "GCP networking fix complete on $(hostname)"
+      ip addr show br-ex
+
+  # --- Join script ---
+  - path: /opt/sunbeam/join.sh
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/bin/bash
+      set -euxo pipefail
+
+      CHECKPOINT_DIR=/opt/sunbeam/.checkpoints
+      mkdir -p "$CHECKPOINT_DIR"
+
+      SSH_KEY="/opt/sunbeam/sunbeam-key"
+      SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -i $SSH_KEY"
+      SSH_USER="${ssh_user}"
+      BOOTSTRAP_IP="${bootstrap_control_ip}"
+      NODE_INDEX=${node_index}
+
+      # Helper: run a command via SSH to localhost to get proper snap cgroup context.
+      # Snap commands fail when run from a systemd service (wrong cgroup).
+      # SSH creates a login session with the correct cgroup environment.
+      run_snap_cmd() {
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i "$SSH_KEY" "$SSH_USER@localhost" "$@"
+      }
+
+      echo "=== Sunbeam JOIN setup started at $(date -u) ==="
+      echo "Running as: $(id)"
+      echo "This is node $NODE_INDEX, bootstrap IP: $BOOTSTRAP_IP"
+
+      run_phase() {
+          local phase="$1"; shift
+          if [ -f "$CHECKPOINT_DIR/$phase.done" ]; then
+              echo "=== Phase $phase already complete, skipping ==="
+              return 0
+          fi
+          echo "=== Starting phase: $phase at $(date -u) ==="
+          "$@"
+          touch "$CHECKPOINT_DIR/$phase.done"
+          echo "=== Completed phase: $phase at $(date -u) ==="
+      }
+
+      # ---------------------------------------------------------------
+      # Phase 00: Wait for ens5 to be clean
+      # ---------------------------------------------------------------
+      wait_for_ens5() {
+          for i in $(seq 1 30); do
+              if ! ip -4 addr show dev ens5 2>/dev/null | grep -q 'inet '; then
+                  echo "ens5 is clean (no IPv4 address)"
+                  ip addr show ens5
+                  return 0
+              fi
+              echo "ens5 still has an IP, waiting (attempt $i)..."
+              sudo ip addr flush dev ens5 2>/dev/null || true
+              sleep 2
+          done
+          echo "WARNING: ens5 may still have an IP after 60s"
+          ip addr show ens5
+      }
+      run_phase "00-wait-ens5" wait_for_ens5
+
+      # ---------------------------------------------------------------
+      # Add static route for MetalLB VIP range via bootstrap node.
+      # GCP's VPC route alone is insufficient during join: before this
+      # node has Cilium, it can't handle MetalLB traffic that GCP might
+      # ECMP-hash to it. This host route ensures we always reach VIPs
+      # via the bootstrap node (which has Cilium + MetalLB running).
+      # ---------------------------------------------------------------
+      if ! ip route show 172.16.1.0/24 | grep -q "via ${bootstrap_control_ip}"; then
+          echo "Adding static route for MetalLB VIPs via bootstrap node (${bootstrap_control_ip})..."
+          sudo ip route add 172.16.1.0/24 via ${bootstrap_control_ip} dev ens4 || true
+      fi
+
+      # ---------------------------------------------------------------
+      # Phase 01: Install the openstack snap
+      # ---------------------------------------------------------------
+      install_snap() {
+          sudo snap install openstack --channel ${snap_channel} || true
+          snap list openstack
+      }
+      run_phase "01-snap-install" install_snap
+
+      # ---------------------------------------------------------------
+      # Phase 02: Prepare the node (NO --bootstrap flag)
+      # Uses SSH-to-localhost to avoid snap cgroup issues in systemd.
+      # ---------------------------------------------------------------
+      prepare_node() {
+          local rc=0
+          for attempt in $(seq 1 10); do
+              echo "  prepare-node attempt $attempt/10..."
+              run_snap_cmd "sunbeam prepare-node-script | bash -x" && return 0
+              rc=$?
+              echo "  prepare-node failed (exit $rc), waiting 30s..."
+              sleep 30
+          done
+          echo "FATAL: prepare-node-script failed after 10 attempts"
+          return $rc
+      }
+      run_phase "02-prepare-node" prepare_node
+
+      # ---------------------------------------------------------------
+      # Phase 03: Poll bootstrap node for join token
+      # SSH to bootstrap node, read /opt/sunbeam/join-token-<N>
+      # ---------------------------------------------------------------
+      poll_for_token() {
+          echo "Polling bootstrap node ($BOOTSTRAP_IP) for join token..."
+          for attempt in $(seq 1 180); do
+              TOKEN=$(ssh $SSH_OPTS $SSH_USER@$BOOTSTRAP_IP \
+                  "cat /opt/sunbeam/join-token-$NODE_INDEX 2>/dev/null" 2>/dev/null) || true
+              if [ -n "$TOKEN" ]; then
+                  echo "$TOKEN" > /opt/sunbeam/my-join-token
+                  echo "Got join token (length: $(echo "$TOKEN" | wc -c) bytes)"
+                  return 0
+              fi
+              echo "  [$attempt/180] Token not ready yet, waiting 30s..."
+              sleep 30
+          done
+          echo "TIMEOUT: Could not get join token after 90 minutes"
+          return 1
+      }
+      run_phase "03-poll-token" poll_for_token
+
+      # ---------------------------------------------------------------
+      # Phase 04: Join the Sunbeam cluster
+      # ---------------------------------------------------------------
+      join_cluster() {
+          # Join can fail transiently — retry up to 20 times
+          # The VIP may take time to stabilize, and Juju operations can be slow
+          # NOTE: TOKEN is a positional argument, NOT --token
+          # Uses SSH-to-localhost to avoid snap cgroup issues in systemd
+          # No 'sg snap_daemon' wrapper needed — SSH session has correct cgroup
+          local rc=0
+          for attempt in $(seq 1 20); do
+              # Re-read token on each attempt — the bootstrap node may have
+              # regenerated it after cleaning up stale state from a failed
+              # 'sunbeam cluster add'. Also handles cases where the token file
+              # was updated after initial polling.
+              local TOKEN
+              TOKEN=$(cat /opt/sunbeam/my-join-token)
+              if [ -z "$TOKEN" ]; then
+                  echo "  Token file is empty, waiting 60s..."
+                  sleep 60
+                  continue
+              fi
+
+              echo "  Join attempt $attempt/20..."
+              run_snap_cmd "sunbeam cluster join \
+                  --role control,compute,storage \
+                  --accept-defaults \
+                  $TOKEN" && return 0
+              rc=$?
+              echo "  Join failed (exit $rc), waiting 60s..."
+
+              # Re-poll for a potentially refreshed token from bootstrap node
+              local NEW_TOKEN
+              NEW_TOKEN=$(ssh $SSH_OPTS $SSH_USER@$BOOTSTRAP_IP \
+                  "cat /opt/sunbeam/join-token-$NODE_INDEX 2>/dev/null" 2>/dev/null) || true
+              if [ -n "$NEW_TOKEN" ] && [ "$NEW_TOKEN" != "$TOKEN" ]; then
+                  echo "  Token was refreshed by bootstrap node, updating local copy"
+                  echo "$NEW_TOKEN" > /opt/sunbeam/my-join-token
+              fi
+
+              sleep 60
+          done
+          echo "FATAL: sunbeam cluster join failed after 20 attempts"
+          return $rc
+      }
+      run_phase "04-join-cluster" join_cluster
+
+      # ---------------------------------------------------------------
+      # Done — signal completion so bootstrap node can proceed
+      # ---------------------------------------------------------------
+      touch /opt/sunbeam/.join-complete
+
+      echo "=== Sunbeam JOIN complete at $(date -u) ==="
+      echo "Node $NODE_INDEX has joined the cluster"
+
+runcmd:
+  - "systemctl daemon-reload"
+  - "systemctl enable --now deconfigure-ens5.service"
+  - "netplan apply"
+  - "systemctl restart google-guest-agent.service"
+  - "sleep 5"
+  - "ip addr flush dev ens5 2>/dev/null || true"
+  - "ip link set dev ens5 up 2>/dev/null || true"
+  - "chown -R ubuntu:ubuntu /opt/sunbeam"
+  - "systemctl enable sunbeam-join.service"
+  - "systemctl enable reapply-gcp-fixes.service"
+  - "systemctl start --no-block sunbeam-join.service"

@@ -1,0 +1,1038 @@
+#cloud-config
+# =============================================================================
+# cloud-init for Sunbeam BOOTSTRAP node (node-1) — ${node_count}-Node Cluster
+#
+# Strategy:
+#   - write_files creates all config to /opt/sunbeam/ and /etc/systemd/
+#   - runcmd enables systemd services:
+#       1. deconfigure-ens5.service     — strips DHCP from ens5 on every boot
+#       2. sunbeam-setup.service        — runs the full bootstrap pipeline
+#       3. reapply-gcp-fixes.service    — reapplies volatile networking on reboot
+#   - sunbeam-setup.service uses checkpoint files for idempotent resume
+#   - After bootstrap: generates join tokens, waits for join nodes,
+#     configures OpenStack, enables features (if toggled on), runs Tempest,
+#     fixes GCP/OVN networking, and launches a test VM
+#
+# On Ubuntu 24.04 with GVNIC:
+#   ens4 = nic0 (control plane, DHCP-managed by GCP)
+#   ens5 = nic1 (external/provider — must be unconfigured for OVS)
+# =============================================================================
+
+write_files:
+  # --- Netplan: disable DHCP on ens5 ---
+  - path: /etc/netplan/90-disable-nic1.yaml
+    permissions: "0600"
+    owner: root:root
+    content: |
+      network:
+        version: 2
+        ethernets:
+          ens5:
+            dhcp4: false
+            dhcp6: false
+            accept-ra: false
+            link-local: []
+            optional: true
+
+  # --- sysctl: disable reverse path filtering ---
+  # GCP floating IP traffic arrives on ens5/br-ex with source IPs from the
+  # provider subnet (10.10.20.0/26) but the reply route goes via br-ex (which
+  # is in the FIP CIDR 10.20.20.0/24). Strict rp_filter drops these packets
+  # because the source address isn't reachable via the incoming interface.
+  - path: /etc/sysctl.d/99-sunbeam-rp-filter.conf
+    permissions: "0644"
+    owner: root:root
+    content: |
+      net.ipv4.conf.all.rp_filter = 0
+      net.ipv4.conf.default.rp_filter = 0
+
+  # --- google-guest-agent: disable network setup ---
+  - path: /etc/default/instance_configs.cfg
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [NetworkInterfaces]
+      ip_forwarding = true
+      dhclient_script = /sbin/google-dhclient-script
+      dhcp_command =
+      setup = false
+
+  # --- systemd: deconfigure ens5 on every boot ---
+  - path: /etc/systemd/system/deconfigure-ens5.service
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Deconfigure ens5 for OVS
+      After=network-online.target google-guest-agent.service
+      Wants=network-online.target
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/bin/bash -c 'rm -f /run/systemd/network/10-netplan-ens5.network.d/override.conf; networkctl reload 2>/dev/null; ip addr flush dev ens5 2>/dev/null; ip link set dev ens5 up 2>/dev/null; sysctl -w net.ipv6.conf.ens5.disable_ipv6=1 2>/dev/null; echo deconfigure-ens5 done'
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # --- systemd: sunbeam setup service ---
+  - path: /etc/systemd/system/sunbeam-setup.service
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Sunbeam OpenStack Bootstrap and Configure (${node_count}-node)
+      After=network-online.target deconfigure-ens5.service
+      Wants=network-online.target deconfigure-ens5.service
+      ConditionPathExists=!/opt/sunbeam/.all-complete
+
+      [Service]
+      Type=oneshot
+      User=ubuntu
+      Group=ubuntu
+      Environment=HOME=/home/ubuntu
+      Environment=USER=ubuntu
+      ExecStart=/opt/sunbeam/setup.sh
+      TimeoutStartSec=10800
+      StandardOutput=append:/var/log/sunbeam-setup.log
+      StandardError=append:/var/log/sunbeam-setup.log
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # --- systemd: reapply GCP networking fixes on reboot ---
+  - path: /etc/systemd/system/reapply-gcp-fixes.service
+    permissions: "0644"
+    owner: root:root
+    content: |
+      [Unit]
+      Description=Reapply GCP/OVN networking fixes after reboot
+      After=network-online.target openvswitch-switch.service ovn-controller.service deconfigure-ens5.service
+      Wants=network-online.target openvswitch-switch.service
+      ConditionPathExists=/opt/sunbeam/gcp-fix-params.env
+
+      [Service]
+      Type=oneshot
+      RemainAfterExit=yes
+      ExecStart=/opt/sunbeam/reapply-gcp-fixes.sh
+
+      [Install]
+      WantedBy=multi-user.target
+
+  # --- reapply GCP fixes script (br-ex MAC + IP + routing, applied on every reboot) ---
+  - path: /opt/sunbeam/reapply-gcp-fixes.sh
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/bin/bash
+      set -euxo pipefail
+      source /opt/sunbeam/gcp-fix-params.env
+      sleep 10
+
+      # Set br-ex MAC to match ens5 (GCP expects traffic from the original NIC MAC)
+      ip link set br-ex address "$ENS5_MAC" 2>/dev/null || true
+      ovs-vsctl set bridge br-ex other-config:hwaddr="$ENS5_MAC" 2>/dev/null || true
+
+      # Restore the GCP-assigned IP on br-ex so OVN can use it for SNAT/floating IPs
+      ip addr add "$GCP_NIC1_IP/$PROVIDER_PREFIX" dev br-ex 2>/dev/null || true
+
+      # Disable reverse path filtering (required for FIP traffic forwarding)
+      sysctl -w net.ipv4.conf.all.rp_filter=0 2>/dev/null || true
+      sysctl -w net.ipv4.conf.ens5.rp_filter=0 2>/dev/null || true
+      sysctl -w net.ipv4.conf.br-ex.rp_filter=0 2>/dev/null || true
+
+      # Add return route for provider subnet via br-ex
+      # Reply traffic to hosts on the provider subnet must go via br-ex/ens5,
+      # not via the default route on ens4 (control plane)
+      PROVIDER_SUBNET="${provider_cidr}"
+      FIP_GATEWAY="${fip_gateway}"
+      if ! ip route show "$PROVIDER_SUBNET" dev br-ex 2>/dev/null | grep -q "$PROVIDER_SUBNET"; then
+          ip route add "$PROVIDER_SUBNET" dev br-ex src "$FIP_GATEWAY" 2>/dev/null || true
+      fi
+
+      echo "GCP networking fixes reapplied (br-ex MAC=$ENS5_MAC, IP=$GCP_NIC1_IP/$PROVIDER_PREFIX)"
+
+  # --- SSH private key for inter-node communication ---
+  - path: /opt/sunbeam/sunbeam-key
+    permissions: "0600"
+    owner: root:root
+    content: |
+      ${indent(6, ssh_private_key)}
+
+  # --- Sunbeam manifest (lists ALL nodes) ---
+  - path: /opt/sunbeam/manifest.yaml
+    permissions: "0644"
+    owner: root:root
+    content: |
+      core:
+        config:
+          bootstrap:
+            management_cidr: "${management_cidr}"
+          external-networks:
+            ${physnet_name}:
+              nics:
+%{ for h in all_hostnames ~}
+                ${h}: "${provider_nic}"
+%{ endfor ~}
+              cidr: "${fip_cidr}"
+              gateway: "${fip_gateway}"
+              range: "${fip_range}"
+              network_type: flat
+          microceph_config:
+%{ for h in all_hostnames ~}
+            ${h}:
+              osd_devices:
+                - /dev/disk/by-id/google-ceph-disk
+%{ endfor ~}
+          user:
+            run_demo_setup: true
+            username: demo
+            cidr: "${tenant_cidr}"
+            nameservers: "8.8.8.8"
+            security_group_rules: true
+            remote_access_location: remote
+            physnet: "${physnet_name}"
+
+  # --- Bootstrap setup script ---
+  - path: /opt/sunbeam/setup.sh
+    permissions: "0755"
+    owner: root:root
+    content: |
+      #!/bin/bash
+      set -euxo pipefail
+
+      CHECKPOINT_DIR=/opt/sunbeam/.checkpoints
+      mkdir -p "$CHECKPOINT_DIR"
+
+      SSH_KEY="/opt/sunbeam/sunbeam-key"
+      SSH_OPTS="-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -i $SSH_KEY"
+      SSH_USER="${ssh_user}"
+      NODE_COUNT=${node_count}
+
+      echo "=== Sunbeam BOOTSTRAP setup started at $(date -u) ==="
+      echo "Running as: $(id)"
+      echo "Node count: $NODE_COUNT"
+
+      # Copy manifest to $HOME so snap-confined binaries can read it
+      cp /opt/sunbeam/manifest.yaml /home/ubuntu/manifest.yaml
+
+      # Helper: run a command via SSH to localhost to get proper snap cgroup context.
+      # Snap commands fail when run from a systemd service (wrong cgroup).
+      # SSH creates a login session with the correct cgroup environment.
+      run_snap_cmd() {
+          ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+              -i "$SSH_KEY" "$SSH_USER@localhost" "$@"
+      }
+
+      run_phase() {
+          local phase="$1"; shift
+          if [ -f "$CHECKPOINT_DIR/$phase.done" ]; then
+              echo "=== Phase $phase already complete, skipping ==="
+              return 0
+          fi
+          echo "=== Starting phase: $phase at $(date -u) ==="
+          "$@"
+          touch "$CHECKPOINT_DIR/$phase.done"
+          echo "=== Completed phase: $phase at $(date -u) ==="
+      }
+
+      # Retry a command up to N times with backoff
+      retry() {
+          local max_attempts="$1"; shift
+          local delay="$1"; shift
+          local rc=0
+          for attempt in $(seq 1 "$max_attempts"); do
+              echo "  [Attempt $attempt/$max_attempts] $*"
+              "$@" && return 0
+              rc=$?
+              if [ "$attempt" -lt "$max_attempts" ]; then
+                  echo "  Failed (exit $rc), retrying in $delay seconds..."
+                  sleep "$delay"
+              fi
+          done
+          echo "  All $max_attempts attempts failed (last exit $rc)"
+          return $rc
+      }
+
+      # Helper: clear any stale terraform locks in the clusterd backend.
+      # These can be left behind if a previous bootstrap/configure attempt
+      # was killed or timed out.
+      clear_stale_terraform_locks() {
+          echo "Checking for stale terraform locks..."
+          local SOCKET="/var/snap/openstack/common/state/control.socket"
+          if [ ! -S "$SOCKET" ]; then
+              echo "  Clusterd socket not found, skipping lock check"
+              return 0
+          fi
+          local plans
+          plans=$(curl -sf --unix-socket "$SOCKET" http://localhost/1.0/terraformlock 2>/dev/null \
+              | python3 -c "import sys,json; [print(p) for p in json.load(sys.stdin).get('metadata',[])]" 2>/dev/null) || return 0
+          if [ -z "$plans" ]; then
+              echo "  No terraform locks found"
+              return 0
+          fi
+          for plan in $plans; do
+              echo "  Unlocking stale terraform plan: $plan"
+              local lock_data
+              lock_data=$(curl -sf --unix-socket "$SOCKET" "http://localhost/1.0/terraformlock/$plan" 2>/dev/null) || continue
+              # lock_data is a JSON-encoded string, need to parse it
+              local lock_body
+              lock_body=$(echo "$lock_data" | python3 -c "import sys,json; print(json.loads(json.load(sys.stdin)))" 2>/dev/null) || lock_body="$lock_data"
+              curl -sf --unix-socket "$SOCKET" -X PUT -d "$lock_body" "http://localhost/1.0/terraformunlock/$plan" 2>/dev/null || true
+              echo "  Unlocked: $plan"
+          done
+      }
+
+      # Helper: ensure the sunbeam_bootstrapped flag is set in clusterd.
+      # After a successful bootstrap (or recovery), this flag must be True
+      # for 'sunbeam configure' and all feature enables to work.
+      # When called with 'recovery' arg, performs additional health checks.
+      ensure_bootstrapped_flag() {
+          local mode="$${1:-normal}"
+          local SOCKET="/var/snap/openstack/common/state/control.socket"
+          if [ ! -S "$SOCKET" ]; then
+              echo "WARNING: Clusterd socket not found, cannot check bootstrapped flag"
+              return 0
+          fi
+          local state
+          state=$(curl -sf --unix-socket "$SOCKET" http://localhost/1.0/config/sunbeam_bootstrapped 2>/dev/null \
+              | python3 -c "import sys,json; d=json.load(sys.stdin); v=d.get('metadata',{}).get('value','') if isinstance(d.get('metadata'),dict) else ''; print(json.loads(v) if v else '')" 2>/dev/null) || state=""
+          if [ "$state" = "True" ]; then
+              echo "sunbeam_bootstrapped flag is already True"
+              return 0
+          fi
+
+          # In recovery mode, verify critical services before forcing the flag
+          if [ "$mode" = "recovery" ]; then
+              echo "WARNING: Force-setting sunbeam_bootstrapped=True after bootstrap error."
+              echo "WARNING: This is a recovery path — subsequent phases may still fail if bootstrap was incomplete."
+              echo "Verifying critical services before proceeding..."
+
+              # Verify Juju controller is responsive
+              if ! run_snap_cmd "timeout 30 juju status -m sunbeam-controller:controller" 2>&1 | grep -qE "active|idle"; then
+                  if ! run_snap_cmd "timeout 30 juju status -m localhost-localhost:controller" 2>&1 | grep -qE "active|idle"; then
+                      echo "ERROR: No Juju controller is responsive — cannot safely set bootstrapped flag"
+                      return 1
+                  fi
+              fi
+
+              # Verify at least one model has active units
+              local has_active=false
+              for ctrl in sunbeam-controller localhost-localhost; do
+                  if run_snap_cmd "timeout 30 juju status -m $ctrl:admin/openstack-machines" 2>&1 | grep -qE "k8s/0.*active"; then
+                      has_active=true
+                      break
+                  fi
+              done
+              if ! $has_active; then
+                  echo "ERROR: No k8s unit is active — cannot safely set bootstrapped flag"
+                  return 1
+              fi
+          fi
+
+          echo "Setting sunbeam_bootstrapped flag to True..."
+          curl -sf --unix-socket "$SOCKET" -X PUT \
+              -d '{"key":"sunbeam_bootstrapped","value":"\"True\""}' \
+              http://localhost/1.0/config/sunbeam_bootstrapped 2>/dev/null || true
+          echo "sunbeam_bootstrapped flag set"
+      }
+
+      # ---------------------------------------------------------------
+      # Phase 00: Wait for ens5 to be clean
+      # ---------------------------------------------------------------
+      wait_for_ens5() {
+          for i in $(seq 1 30); do
+              if ! ip -4 addr show dev ens5 2>/dev/null | grep -q 'inet '; then
+                  echo "ens5 is clean (no IPv4 address)"
+                  ip addr show ens5
+                  return 0
+              fi
+              echo "ens5 still has an IP, waiting (attempt $i)..."
+              sudo ip addr flush dev ens5 2>/dev/null || true
+              sleep 2
+          done
+          echo "WARNING: ens5 may still have an IP after 60s"
+          ip addr show ens5
+      }
+      run_phase "00-wait-ens5" wait_for_ens5
+
+      # ---------------------------------------------------------------
+      # Phase 01: Install the openstack snap
+      # ---------------------------------------------------------------
+      install_snap() {
+          sudo snap install openstack --channel ${snap_channel} || true
+          snap list openstack
+      }
+      run_phase "01-snap-install" install_snap
+
+      # ---------------------------------------------------------------
+      # Phase 02: Prepare the node (bootstrap mode)
+      # Uses SSH-to-localhost to avoid snap cgroup issues in systemd.
+      # ---------------------------------------------------------------
+      prepare_node() {
+          local rc=0
+          for attempt in $(seq 1 5); do
+              echo "  prepare-node attempt $attempt/5..."
+              run_snap_cmd "sunbeam prepare-node-script --bootstrap | bash -x" && return 0
+              rc=$?
+              echo "  prepare-node failed (exit $rc), waiting 30s..."
+              sleep 30
+          done
+          echo "FATAL: prepare-node-script failed after 5 attempts"
+          return $rc
+      }
+      run_phase "02-prepare-node" prepare_node
+
+      # ---------------------------------------------------------------
+      # Phase 02b: Fix Juju LXD container AppArmor profiles
+      #
+      # After 'sunbeam prepare-node-script --bootstrap', Juju is
+      # bootstrapped into an LXD container. The container has
+      # security.nesting=true, but AppArmor profiles are NOT
+      # regenerated until the container is restarted. Without this,
+      # dqlite (Juju's database) cannot use abstract unix sockets
+      # and the controller is non-functional.
+      #
+      # This fix restarts the Juju LXD container so AppArmor profiles
+      # are regenerated with correct nesting permissions.
+      # ---------------------------------------------------------------
+      fix_juju_lxd_apparmor() {
+          echo "Restarting Juju controller LXD container to fix AppArmor profiles..."
+          local JUJU_CONTAINER
+          JUJU_CONTAINER=$(run_snap_cmd "lxc list --format csv" 2>/dev/null | grep juju | cut -d',' -f1)
+          if [ -z "$JUJU_CONTAINER" ]; then
+              echo "WARNING: No Juju LXD container found — skipping AppArmor fix"
+              echo "This is expected if prepare-node did not bootstrap Juju yet"
+              return 0
+          fi
+          echo "Found Juju container: $JUJU_CONTAINER"
+
+          # Restart the container
+          run_snap_cmd "lxc restart $JUJU_CONTAINER"
+          echo "Container restarted, waiting 30s for full startup..."
+          sleep 30
+
+          # Verify Juju controller is accessible
+          for i in $(seq 1 30); do
+              if run_snap_cmd "timeout 15 juju status -m localhost-localhost:controller" 2>&1 | grep -q "active"; then
+                  echo "Juju controller is healthy after LXD container restart (attempt $i)"
+                  return 0
+              fi
+              echo "  [$i/30] Juju controller not ready yet, waiting 10s..."
+              sleep 10
+          done
+          echo "WARNING: Juju controller may not be fully healthy after restart — proceeding anyway"
+          # Don't fail here — bootstrap will detect the issue if it's truly broken
+      }
+      run_phase "02b-fix-juju-apparmor" fix_juju_lxd_apparmor
+
+      # ---------------------------------------------------------------
+      # Phase 03: Bootstrap Sunbeam cluster
+      #
+      # 'sunbeam cluster bootstrap' IS re-runnable — if it fails mid-way
+      # (e.g. during Juju controller migration), re-running it completes
+      # the remaining steps. We handle failures by:
+      #   1. Clearing any stale terraform locks first
+      #   2. Running bootstrap and capturing its exit code
+      #   3. If it fails, clearing locks again and RE-RUNNING bootstrap
+      #      (proven to work for partial migration failures)
+      #   4. If the second attempt also fails, checking cluster health
+      #   5. Only force-setting the bootstrapped flag if the cluster is
+      #      genuinely healthy (k8s active, controller responsive)
+      # ---------------------------------------------------------------
+      bootstrap_sunbeam() {
+          # Clear any stale terraform locks from previous attempts
+          clear_stale_terraform_locks
+
+          local rc=0
+          run_snap_cmd "sunbeam cluster bootstrap \
+              --manifest /home/ubuntu/manifest.yaml \
+              --role control,compute,storage \
+              --accept-defaults" || rc=$?
+
+          if [ "$rc" -eq 0 ]; then
+              echo "Bootstrap completed successfully"
+              ensure_bootstrapped_flag
+              return 0
+          fi
+
+          echo "WARNING: bootstrap exited with code $rc — attempting recovery..."
+          echo "Waiting 60s before retry..."
+          sleep 60
+
+          # Re-running bootstrap completes any partial work (e.g. unfinished
+          # Juju controller migration). Clear locks first.
+          clear_stale_terraform_locks
+
+          local rc2=0
+          echo "=== Re-running sunbeam cluster bootstrap (recovery attempt) ==="
+          run_snap_cmd "sunbeam cluster bootstrap \
+              --manifest /home/ubuntu/manifest.yaml \
+              --role control,compute,storage \
+              --accept-defaults" || rc2=$?
+
+          if [ "$rc2" -eq 0 ]; then
+              echo "Bootstrap recovery succeeded on re-run"
+              ensure_bootstrapped_flag
+              return 0
+          fi
+
+          echo "WARNING: bootstrap re-run also failed (exit $rc2) — checking cluster health..."
+          sleep 60
+
+          # Check if cluster is actually functional despite the error.
+          # NOTE: After successful bootstrap, the openstack-machines model
+          # migrates from localhost-localhost to sunbeam-controller. We must
+          # check BOTH controllers since we don't know which state we're in.
+          local cluster_ok=false
+          for attempt in $(seq 1 10); do
+              echo "Health check attempt $attempt/10..."
+
+              # Check 1: Is the node ONLINE in sunbeam cluster list?
+              if run_snap_cmd "sunbeam cluster list" 2>&1 | grep -q "ONLINE"; then
+                  echo "  Cluster shows ONLINE"
+
+                  # Check 2: Is the k8s unit active/idle?
+                  # Try sunbeam-controller first (post-migration), fall back to localhost-localhost (pre-migration)
+                  local k8s_ok=false
+                  for ctrl in sunbeam-controller localhost-localhost; do
+                      if run_snap_cmd "timeout 30 juju status -m $ctrl:admin/openstack-machines" 2>&1 | grep -q "k8s/0.*active.*idle"; then
+                          echo "  k8s/0 is active/idle (via $ctrl)"
+                          k8s_ok=true
+                          break
+                      fi
+                  done
+
+                  if $k8s_ok; then
+                      # Check 3: Is the sunbeam-controller working?
+                      if run_snap_cmd "timeout 15 juju status -m sunbeam-controller:controller" 2>&1 | grep -q "controller/0.*active"; then
+                          echo "  sunbeam-controller is healthy"
+                          cluster_ok=true
+                          break
+                      else
+                          # sunbeam-controller model may not exist yet — if k8s is healthy, that's enough
+                          echo "  sunbeam-controller check inconclusive, but k8s is healthy"
+                          cluster_ok=true
+                          break
+                      fi
+                  fi
+              fi
+
+              echo "  Cluster not yet healthy, waiting 30s..."
+              sleep 30
+          done
+
+          if $cluster_ok; then
+              echo "Cluster is healthy despite bootstrap errors — proceeding"
+              ensure_bootstrapped_flag recovery
+              return 0
+          else
+              echo "FATAL: Bootstrap failed after 2 attempts and cluster is not healthy"
+              echo "--- sunbeam cluster list ---"
+              run_snap_cmd "sunbeam cluster list" 2>&1 || true
+              echo "--- juju status openstack-machines (sunbeam-controller) ---"
+              run_snap_cmd "timeout 30 juju status -m sunbeam-controller:admin/openstack-machines" 2>&1 || true
+              echo "--- juju status openstack-machines (localhost-localhost) ---"
+              run_snap_cmd "timeout 30 juju status -m localhost-localhost:admin/openstack-machines" 2>&1 || true
+              return 1
+          fi
+      }
+      run_phase "03-bootstrap" bootstrap_sunbeam
+
+      # ---------------------------------------------------------------
+      # Phase 04: Generate join tokens for all other nodes
+      # For each join node, run 'sunbeam cluster add <hostname>'
+      # and write the token to /opt/sunbeam/join-token-<N>
+      #
+      # IMPORTANT: Tokens are generated ONE AT A TIME, and the bootstrap
+      # node waits for each join node to complete before generating the
+      # next token. This avoids terraform state lock conflicts when
+      # multiple nodes join simultaneously.
+      # ---------------------------------------------------------------
+      generate_token_and_wait_for_join() {
+          if [ "$NODE_COUNT" -le 1 ]; then
+              echo "Single-node mode, no joins needed"
+              return 0
+          fi
+
+          ALL_IPS=(${join(" ", all_control_ips)})
+
+          for i in $(seq 2 $NODE_COUNT); do
+              HOSTNAME="sunbeam-node-$i.cluster.local"
+              IDX=$((i - 1))
+              NODE_IP="$${ALL_IPS[$IDX]}"
+              echo "=== Processing join for sunbeam-node-$i ($HOSTNAME, $NODE_IP) ==="
+
+              # Step 1: Generate token (skip if node already joined)
+              # Check if node already joined (e.g. from a previous attempt)
+              if ssh $SSH_OPTS $SSH_USER@$NODE_IP "test -f /opt/sunbeam/.join-complete" 2>/dev/null; then
+                  echo "sunbeam-node-$i already has .join-complete — skipping token generation"
+                  echo "=== sunbeam-node-$i join complete, proceeding ==="
+                  continue
+              fi
+
+              echo "Generating join token for $HOSTNAME..."
+              local rc=1
+              local TOKEN=""
+              local add_rc=0
+              for attempt in $(seq 1 5); do
+                  echo "  Attempt $attempt/5 for $HOSTNAME..."
+                  TOKEN=$(run_snap_cmd "sunbeam cluster add $HOSTNAME" 2>&1) && add_rc=0 || add_rc=$?
+                  if [ "$add_rc" -eq 0 ]; then
+                      rc=0
+                      break
+                  fi
+                  # Handle "already a member" — node joined from a previous attempt
+                  if echo "$TOKEN" | grep -qi "already a member"; then
+                      echo "  Node $HOSTNAME is already a member of the cluster"
+                      rc=0
+                      TOKEN=""
+                      break
+                  fi
+                  echo "  Failed: $TOKEN"
+
+                  # Clean up stale state from partial 'sunbeam cluster add'.
+                  # If plan1 partially succeeded (created juju user entry in clusterd)
+                  # but plan2 never ran (didn't store token), re-running cluster add
+                  # will SKIP storing the token because the user entry already exists.
+                  # Fix: delete the stale juju user entry so cluster add starts fresh.
+                  echo "  Cleaning up stale state for $HOSTNAME..."
+                  local SOCKET="/var/snap/openstack/common/state/control.socket"
+                  if [ -S "$SOCKET" ]; then
+                      curl -sf --unix-socket "$SOCKET" -X DELETE \
+                          "http://localhost/1.0/jujuusers/$HOSTNAME" 2>/dev/null || true
+                      echo "  Deleted juju user entry for $HOSTNAME from clusterd (if it existed)"
+                  fi
+                  # Also try to remove the node from the cluster (handles partial cluster add)
+                  run_snap_cmd "sunbeam cluster remove $HOSTNAME" 2>/dev/null || true
+                  # Remove the juju user (handles partial juju user creation)
+                  run_snap_cmd "juju remove-user $HOSTNAME --yes" 2>/dev/null || true
+
+                  echo "  Waiting 30s before retry..."
+                  sleep 30
+              done
+
+              if [ "$rc" -ne 0 ]; then
+                  echo "FATAL: Could not generate token for $HOSTNAME after 5 attempts"
+                  return 1
+              fi
+
+              # Only write token file if we got a new token (atomic write to prevent partial reads)
+              if [ -n "$TOKEN" ]; then
+                  echo "$TOKEN" | grep -oP '(?<=: )eyJ\S+' > /opt/sunbeam/join-token-$i.tmp || echo "$TOKEN" > /opt/sunbeam/join-token-$i.tmp
+                  mv /opt/sunbeam/join-token-$i.tmp /opt/sunbeam/join-token-$i
+                  echo "Token for $HOSTNAME written to /opt/sunbeam/join-token-$i"
+              fi
+
+              # Step 2: Wait for this node to complete its join
+              # Each join can take 30-45 min; with retries, allow up to 2 hours
+              echo "Waiting for sunbeam-node-$i ($NODE_IP) to complete join..."
+              for attempt in $(seq 1 240); do
+                  if ssh $SSH_OPTS $SSH_USER@$NODE_IP "test -f /opt/sunbeam/.join-complete" 2>/dev/null; then
+                      echo "sunbeam-node-$i has joined the cluster!"
+                      break
+                  fi
+                  if [ "$attempt" -eq 240 ]; then
+                      echo "TIMEOUT: sunbeam-node-$i did not join within 2 hours"
+                      return 1
+                  fi
+                  echo "  [$attempt/240] Still waiting for sunbeam-node-$i..."
+                  sleep 30
+              done
+
+              echo "=== sunbeam-node-$i join complete, proceeding ==="
+          done
+          echo "All join nodes have completed!"
+      }
+      run_phase "04-join-all-nodes" generate_token_and_wait_for_join
+
+      # ---------------------------------------------------------------
+      # Phase 05: Configure OpenStack
+      # ---------------------------------------------------------------
+      configure_sunbeam() {
+          # Clear any stale terraform locks before configure
+          clear_stale_terraform_locks
+          retry 3 120 run_snap_cmd "sunbeam configure \
+              --manifest /home/ubuntu/manifest.yaml \
+              --openrc /home/ubuntu/demo-openrc \
+              --accept-defaults"
+      }
+      run_phase "05-configure" configure_sunbeam
+
+      # ---------------------------------------------------------------
+      # Phase 05b: Enable local-mode floating IP access
+      #
+      # Sunbeam forces remote_access_location=remote for multi-node
+      # clusters, which sets external-bridge-address=0.0.0.0/0 (no IP
+      # on br-ex). On GCP, floating IPs are unreachable in remote mode
+      # because GCP's virtual networking can't deliver intra-subnet
+      # traffic to IPs not assigned to any VM NIC.
+      #
+      # The fix: set external-bridge-address to the FIP gateway IP.
+      # This makes the hypervisor charm:
+      #   1. Add the gateway IP (e.g. 10.20.20.1/24) to br-ex
+      #   2. Add iptables MASQUERADE rule for SNAT
+      #   3. Enable chassis-as-gw on OVN
+      #
+      # With the IP on br-ex, the kernel has a route for 10.20.20.0/24
+      # via br-ex. When GCP routes floating IP traffic to this node
+      # (via the custom GCP route), the kernel receives it on ens5,
+      # OVS delivers it to br-ex's internal port, the kernel ARPs for
+      # the floating IP on br-ex, OVN responds, and the packet flows
+      # through OVN for DNAT to the tenant VM.
+      #
+      # NOTE: We set this on the application (all units), but only
+      # node-1 has the GCP route pointing to it. The other nodes will
+      # also have the IP on br-ex (which enables them as gateway
+      # chassis for OVN HA), but GCP won't route to them directly.
+      # ---------------------------------------------------------------
+      enable_local_mode_fip() {
+          echo "Setting external-bridge-address=${fip_gateway}/${fip_prefix} for local-mode floating IP access..."
+
+          # Set the config on the hypervisor charm
+          retry 3 30 run_snap_cmd "juju config -m admin/openstack-machines openstack-hypervisor external-bridge-address=${fip_gateway}/${fip_prefix}"
+
+          # Wait for the charm to process the config change.
+          # The hypervisor units will briefly go into maintenance while reconfiguring.
+          echo "Waiting for hypervisor units to process config change..."
+          sleep 30
+          for attempt in $(seq 1 30); do
+              local status
+              status=$(run_snap_cmd "juju status -m admin/openstack-machines openstack-hypervisor --format=short" 2>&1) || true
+              if echo "$status" | grep -q "openstack-hypervisor" && ! echo "$status" | grep -q "maintenance"; then
+                  echo "Hypervisor charm has processed external-bridge-address change"
+                  break
+              fi
+              echo "  [$attempt/30] Hypervisor still processing, waiting 10s..."
+              sleep 10
+          done
+
+          # Verify br-ex got the IP
+          if ip addr show br-ex 2>/dev/null | grep -q "${fip_gateway}"; then
+              echo "Confirmed: br-ex has ${fip_gateway}/${fip_prefix}"
+          else
+              echo "WARNING: br-ex does not have ${fip_gateway} yet — charm may still be processing"
+              echo "Current br-ex state:"
+              ip addr show br-ex 2>/dev/null || echo "br-ex not found"
+          fi
+
+          # Add return route for provider subnet via br-ex.
+          # Reply packets to the GCP test-vm (or any host on the provider subnet)
+          # need to go out via br-ex/ens5, not via the default route on ens4.
+          PROVIDER_SUBNET="${provider_cidr}"
+          if ! ip route show "$PROVIDER_SUBNET" dev br-ex 2>/dev/null | grep -q "$PROVIDER_SUBNET"; then
+              echo "Adding return route: $PROVIDER_SUBNET dev br-ex src ${fip_gateway}"
+              sudo ip route add "$PROVIDER_SUBNET" dev br-ex src ${fip_gateway} 2>/dev/null || true
+          fi
+
+          # Ensure rp_filter is disabled on br-ex and ens5 (may have been reset)
+          sudo sysctl -w net.ipv4.conf.br-ex.rp_filter=0 2>/dev/null || true
+          sudo sysctl -w net.ipv4.conf.ens5.rp_filter=0 2>/dev/null || true
+          sudo sysctl -w net.ipv4.conf.all.rp_filter=0 2>/dev/null || true
+      }
+      run_phase "05b-enable-local-fip" enable_local_mode_fip
+
+      # ---------------------------------------------------------------
+      # Phase 06: Enable Telemetry (optional)
+      # Must be enabled before observability and resource-optimization
+      # ---------------------------------------------------------------
+%{ if enable_telemetry ~}
+      enable_telemetry() {
+          retry 3 120 run_snap_cmd "sunbeam enable telemetry"
+      }
+      run_phase "06-enable-telemetry" enable_telemetry
+
+      # ---------------------------------------------------------------
+      # Phase 06b: Fix Gnocchi Ceph replication count
+      #
+      # With 3 Ceph OSDs, pools default to size=3. But gnocchi's charm
+      # requests replicas=1 in the Ceph broker, causing a mismatch that
+      # can result in "unexpected error" (exit-code 1) in the broker
+      # response. The charm then thinks Ceph isn't ready and blocks.
+      #
+      # Fix: set ceph-osd-replication-count to match node count, then
+      # check if the gnocchi app is stuck. If so, remove and re-add the
+      # ceph relation to trigger a fresh broker request.
+      # ---------------------------------------------------------------
+      fix_gnocchi_ceph() {
+          echo "Setting gnocchi ceph-osd-replication-count=${node_count}..."
+          run_snap_cmd "juju config -m openstack gnocchi ceph-osd-replication-count=${node_count}" 2>/dev/null || true
+
+          # Check if gnocchi is blocked/waiting on ceph
+          sleep 30
+          local gnocchi_status
+          gnocchi_status=$(run_snap_cmd "juju status -m openstack gnocchi --format=short" 2>&1) || true
+          if echo "$gnocchi_status" | grep -qE "blocked|waiting|error"; then
+              echo "Gnocchi appears stuck, refreshing ceph relation..."
+              run_snap_cmd "juju remove-relation -m openstack gnocchi:ceph microceph:ceph" 2>/dev/null || true
+              sleep 15
+              run_snap_cmd "juju integrate -m openstack gnocchi:ceph microceph:ceph" 2>/dev/null || true
+              echo "Ceph relation refreshed, waiting for gnocchi to settle..."
+              sleep 60
+
+              # Trigger update-status to speed up charm evaluation
+              run_snap_cmd "juju exec -m openstack --app gnocchi -- juju-exec hooks/update-status" 2>/dev/null || true
+          else
+              echo "Gnocchi appears healthy, no ceph relation fix needed"
+          fi
+      }
+      run_phase "06b-fix-gnocchi-ceph" fix_gnocchi_ceph
+%{ else ~}
+      echo "=== Telemetry skipped (enable_telemetry=false) ==="
+%{ endif ~}
+
+      # ---------------------------------------------------------------
+      # Phase 07: Enable DNS (Designate) (optional)
+      # ---------------------------------------------------------------
+%{ if enable_dns ~}
+      enable_dns() {
+          retry 3 120 run_snap_cmd "sunbeam enable dns ns1.example.com."
+      }
+      run_phase "07-enable-dns" enable_dns
+%{ else ~}
+      echo "=== DNS skipped (enable_dns=false) ==="
+%{ endif ~}
+
+      # ---------------------------------------------------------------
+      # Phase 08: Enable Resource Optimization (Watcher) (optional)
+      # Requires telemetry (should be enabled in phase 06)
+      # ---------------------------------------------------------------
+%{ if enable_resource_optimization ~}
+      enable_resource_optimization() {
+%{ if !enable_telemetry ~}
+          echo "WARNING: resource-optimization requires telemetry, which is disabled. Skipping."
+%{ else ~}
+          retry 3 120 run_snap_cmd "sunbeam enable resource-optimization"
+%{ endif ~}
+      }
+      run_phase "08-enable-resource-optimization" enable_resource_optimization
+%{ else ~}
+      echo "=== Resource Optimization skipped (enable_resource_optimization=false) ==="
+%{ endif ~}
+
+      # ---------------------------------------------------------------
+      # Phase 09: Enable Observability Embedded (COS Lite) (optional)
+      # Requires telemetry (should be enabled in phase 06)
+      # ---------------------------------------------------------------
+%{ if enable_observability ~}
+      enable_observability() {
+%{ if !enable_telemetry ~}
+          echo "WARNING: observability requires telemetry, which is disabled. Skipping."
+%{ else ~}
+          retry 3 120 run_snap_cmd "sunbeam enable observability embedded"
+%{ endif ~}
+      }
+      run_phase "09-enable-observability" enable_observability
+%{ else ~}
+      echo "=== Observability skipped (enable_observability=false) ==="
+%{ endif ~}
+
+      # ---------------------------------------------------------------
+      # Phase 10: Enable Validation (Tempest) — optional
+      # Controlled by enable_tempest variable
+      # ---------------------------------------------------------------
+%{ if enable_tempest ~}
+      enable_validation() {
+          retry 3 120 run_snap_cmd "sunbeam enable validation"
+      }
+      run_phase "10-enable-validation" enable_validation
+
+      # ---------------------------------------------------------------
+      # Phase 11: Run Tempest (refstack profile)
+      # ---------------------------------------------------------------
+      run_tempest() {
+          run_snap_cmd "sunbeam validation run refstack" | tee /opt/sunbeam/tempest-results.txt || true
+          echo "Tempest results saved to /opt/sunbeam/tempest-results.txt"
+      }
+      run_phase "11-run-tempest" run_tempest
+%{ else ~}
+      echo "=== Tempest validation skipped (enable_tempest=false) ==="
+%{ endif ~}
+
+      # ---------------------------------------------------------------
+      # Phase 12: Fix GCP <-> OVN networking (on bootstrap node)
+      #
+      # 1. br-ex MAC mismatch fix — GCP expects traffic from ens5's MAC
+      # 2. OVN static MAC bindings — GCP uses deterministic MACs but
+      #    OVN can't ARP on GCP's virtual network, so we add static entries
+      # ---------------------------------------------------------------
+      fix_gcp_ovn_routing() {
+          PROVIDER_NIC="${provider_nic}"
+          PROVIDER_CIDR="${provider_cidr}"
+
+          # Derive ens5 MAC
+          ENS5_MAC=$(cat /sys/class/net/$PROVIDER_NIC/address)
+          echo "ens5 MAC: $ENS5_MAC"
+
+          # GCP-assigned IP for this NIC
+          GCP_NIC1_IP=$(curl -s -H "Metadata-Flavor: Google" \
+              "http://metadata.google.internal/computeMetadata/v1/instance/network-interfaces/1/ip" 2>/dev/null)
+          echo "GCP NIC1 IP: $GCP_NIC1_IP"
+
+          PROVIDER_PREFIX=$(echo "$PROVIDER_CIDR" | cut -d'/' -f2)
+
+          # Fix 1: Set br-ex MAC to match ens5
+          echo "Setting br-ex MAC to $ENS5_MAC"
+          sudo ovs-vsctl set bridge br-ex other-config:hwaddr="$ENS5_MAC"
+          sudo ip link set br-ex address "$ENS5_MAC"
+          sudo ip addr add "$GCP_NIC1_IP/$PROVIDER_PREFIX" dev br-ex 2>/dev/null || true
+
+          # Fix 2: Static MAC bindings for ALL GCP hosts in provider subnet
+          # OVN can't ARP on GCP's virtual network — GCP uses deterministic
+          # MACs (42:01:xx:xx:xx:xx) that we must add as static entries.
+          JUJU_OVN_SSH="juju ssh -m openstack --container ovn-nb-db-server ovn-central/0"
+
+          OVN_SHOW=$(run_snap_cmd "$JUJU_OVN_SSH 'ovn-nbctl show'" 2>/dev/null)
+          PROVIDER_NET_PREFIX=$(echo "$PROVIDER_CIDR" | cut -d'.' -f1-3)
+          ROUTER_PORT_NAME=$(echo "$OVN_SHOW" \
+              | grep -B2 "$PROVIDER_NET_PREFIX" \
+              | grep "port lrp-" \
+              | awk '{print $2}' \
+              | head -1)
+          echo "OVN router port: $ROUTER_PORT_NAME"
+
+          if [ -z "$ROUTER_PORT_NAME" ]; then
+              echo "ERROR: Could not determine OVN router port."
+              echo "$OVN_SHOW"
+              return 1
+          fi
+
+          PROVIDER_NET=$(echo "$PROVIDER_CIDR" | cut -d'/' -f1)
+          IFS='.' read -r O1 O2 O3 O4 <<< "$PROVIDER_NET"
+          SUBNET_SIZE=$((1 << (32 - PROVIDER_PREFIX)))
+          echo "Adding static MAC bindings for $SUBNET_SIZE IPs in $PROVIDER_CIDR (batched)"
+
+          # Build a single script with all ovn-nbctl commands to avoid 62 individual SSH sessions
+          MAC_CMDS=""
+          for i in $(seq 1 $((SUBNET_SIZE - 2))); do
+              IP_LAST=$((O4 + i))
+              HOST_IP="$O1.$O2.$O3.$IP_LAST"
+              HOST_MAC=$(printf '42:01:%02x:%02x:%02x:%02x' "$O1" "$O2" "$O3" "$IP_LAST")
+              MAC_CMDS="$MAC_CMDS ovn-nbctl --may-exist static-mac-binding-add $ROUTER_PORT_NAME $HOST_IP $HOST_MAC;"
+          done
+          run_snap_cmd "$JUJU_OVN_SSH '$MAC_CMDS'" 2>/dev/null || {
+              echo "WARNING: Batched MAC binding failed, falling back to individual commands"
+              for i in $(seq 1 $((SUBNET_SIZE - 2))); do
+                  IP_LAST=$((O4 + i))
+                  HOST_IP="$O1.$O2.$O3.$IP_LAST"
+                  HOST_MAC=$(printf '42:01:%02x:%02x:%02x:%02x' "$O1" "$O2" "$O3" "$IP_LAST")
+                  run_snap_cmd "$JUJU_OVN_SSH 'ovn-nbctl --may-exist static-mac-binding-add $ROUTER_PORT_NAME $HOST_IP $HOST_MAC'" 2>/dev/null || true
+              done
+          }
+
+          # Save parameters for reboot persistence (only br-ex MAC + IP needed now)
+          printf '%s\n' \
+              "ENS5_MAC=$ENS5_MAC" \
+              "GCP_NIC1_IP=$GCP_NIC1_IP" \
+              "PROVIDER_PREFIX=$PROVIDER_PREFIX" \
+              "PROVIDER_NIC=$PROVIDER_NIC" \
+              > /opt/sunbeam/gcp-fix-params.env
+
+          # Ensure rp_filter is disabled (may have been reset by charm operations)
+          sudo sysctl -w net.ipv4.conf.all.rp_filter=0 2>/dev/null || true
+          sudo sysctl -w net.ipv4.conf.ens5.rp_filter=0 2>/dev/null || true
+          sudo sysctl -w net.ipv4.conf.br-ex.rp_filter=0 2>/dev/null || true
+
+          # Ensure return route for provider subnet via br-ex
+          if ! ip route show "$PROVIDER_CIDR" dev br-ex 2>/dev/null | grep -q "$PROVIDER_CIDR"; then
+              echo "Adding return route: $PROVIDER_CIDR dev br-ex src ${fip_gateway}"
+              sudo ip route add "$PROVIDER_CIDR" dev br-ex src ${fip_gateway} 2>/dev/null || true
+          fi
+
+          echo "--- br-ex state ---"
+          ip addr show br-ex
+      }
+      run_phase "12-fix-gcp-ovn" fix_gcp_ovn_routing
+
+      # ---------------------------------------------------------------
+      # Phase 13: Trigger GCP fixes on join nodes via SSH
+      # Each join node needs its own br-ex MAC fix
+      # ---------------------------------------------------------------
+      fix_join_nodes_networking() {
+          if [ "$NODE_COUNT" -le 1 ]; then
+              echo "Single-node mode, no join nodes to fix"
+              return 0
+          fi
+
+          ALL_IPS=(${join(" ", all_control_ips)})
+          local all_ok=true
+
+          for i in $(seq 2 $NODE_COUNT); do
+              IDX=$((i - 1))
+              NODE_IP="$${ALL_IPS[$IDX]}"
+              echo "Triggering GCP networking fix on sunbeam-node-$i ($NODE_IP)..."
+              local fixed=false
+              for attempt in $(seq 1 3); do
+                  if ssh $SSH_OPTS $SSH_USER@$NODE_IP "sudo bash /opt/sunbeam/fix-gcp-local.sh" 2>&1; then
+                      echo "sunbeam-node-$i networking fix complete"
+                      fixed=true
+                      break
+                  fi
+                  echo "  Attempt $attempt/3 failed for sunbeam-node-$i, waiting 30s..."
+                  sleep 30
+              done
+              if ! $fixed; then
+                  echo "ERROR: Could not apply GCP networking fix on sunbeam-node-$i after 3 attempts"
+                  all_ok=false
+              fi
+          done
+
+          if ! $all_ok; then
+              echo "ERROR: Some join nodes failed GCP networking fix — do NOT checkpoint this phase"
+              return 1
+          fi
+      }
+      run_phase "13-fix-join-nodes" fix_join_nodes_networking
+
+      # ---------------------------------------------------------------
+      # Phase 14: Launch a test VM and assign a floating IP
+      # ---------------------------------------------------------------
+      launch_test_vm() {
+          run_snap_cmd "source /home/ubuntu/demo-openrc && \
+              if openstack server show test-vm-tenant &>/dev/null; then \
+                  echo 'test-vm-tenant already exists, skipping create'; \
+              else \
+                  openstack server create \
+                      --image ubuntu \
+                      --flavor m1.small \
+                      --network demo-network \
+                      --wait \
+                      test-vm-tenant; \
+              fi && \
+              echo '--- Assigning floating IP ---' && \
+              EXISTING_FIP=\$(openstack floating ip list --fixed-ip-address \$(openstack server show test-vm-tenant -f value -c addresses | grep -oP '[\d.]+') -f value -c 'Floating IP Address' 2>/dev/null | head -1) && \
+              if [ -n \"\$EXISTING_FIP\" ]; then \
+                  echo \"Floating IP already assigned: \$EXISTING_FIP\"; \
+              else \
+                  FIP=\$(openstack floating ip create external-network -f value -c floating_ip_address) && \
+                  openstack server add floating ip test-vm-tenant \$FIP && \
+                  echo \"Floating IP assigned: \$FIP\"; \
+              fi && \
+              echo '--- Server details ---' && \
+              openstack server show test-vm-tenant"
+      }
+      run_phase "14-test-vm" launch_test_vm
+
+      # ---------------------------------------------------------------
+      # Done — mark complete
+      # ---------------------------------------------------------------
+      touch /opt/sunbeam/.all-complete
+
+      echo "=== Sunbeam ${node_count}-node setup COMPLETE at $(date -u) ==="
+      run_snap_cmd "sunbeam cluster list" || true
+      run_snap_cmd "source /home/ubuntu/demo-openrc && openstack server list" || true
+      run_snap_cmd "source /home/ubuntu/demo-openrc && openstack network list" || true
+      run_snap_cmd "source /home/ubuntu/demo-openrc && openstack router show demo-router -f yaml" || true
+
+runcmd:
+  - "systemctl daemon-reload"
+  - "systemctl enable --now deconfigure-ens5.service"
+  - "netplan apply"
+  - "systemctl restart google-guest-agent.service"
+  - "sleep 5"
+  - "ip addr flush dev ens5 2>/dev/null || true"
+  - "ip link set dev ens5 up 2>/dev/null || true"
+  - "chown -R ubuntu:ubuntu /opt/sunbeam"
+  - "systemctl enable sunbeam-setup.service"
+  - "systemctl enable reapply-gcp-fixes.service"
+  - "systemctl start --no-block sunbeam-setup.service"
