@@ -293,11 +293,10 @@ write_files:
       }
 
       # Helper: ensure the sunbeam_bootstrapped flag is set in clusterd.
-      # After a successful bootstrap (or recovery), this flag must be True
-      # for 'sunbeam configure' and all feature enables to work.
-      # When called with 'recovery' arg, performs additional health checks.
+      # After a successful bootstrap, this flag must be True for
+      # 'sunbeam configure' and all feature enables to work.
+      # Only called after bootstrap exits 0 (success).
       ensure_bootstrapped_flag() {
-          local mode="$${1:-normal}"
           local SOCKET="/var/snap/openstack/common/state/control.socket"
           if [ ! -S "$SOCKET" ]; then
               echo "WARNING: Clusterd socket not found, cannot check bootstrapped flag"
@@ -305,38 +304,10 @@ write_files:
           fi
           local state
           state=$(curl -sf --unix-socket "$SOCKET" http://localhost/1.0/config/sunbeam_bootstrapped 2>/dev/null \
-              | python3 -c "import sys,json; d=json.load(sys.stdin); v=d.get('metadata',{}).get('value','') if isinstance(d.get('metadata'),dict) else ''; print(json.loads(v) if v else '')" 2>/dev/null) || state=""
+              | python3 -c "import sys,json; d=json.load(sys.stdin); print(json.loads(d.get('metadata','\"\"')))" 2>/dev/null) || state=""
           if [ "$state" = "True" ]; then
               echo "sunbeam_bootstrapped flag is already True"
               return 0
-          fi
-
-          # In recovery mode, verify critical services before forcing the flag
-          if [ "$mode" = "recovery" ]; then
-              echo "WARNING: Force-setting sunbeam_bootstrapped=True after bootstrap error."
-              echo "WARNING: This is a recovery path — subsequent phases may still fail if bootstrap was incomplete."
-              echo "Verifying critical services before proceeding..."
-
-              # Verify Juju controller is responsive
-              if ! run_snap_cmd "timeout 30 juju status -m sunbeam-controller:controller" 2>&1 | grep -qE "active|idle"; then
-                  if ! run_snap_cmd "timeout 30 juju status -m localhost-localhost:controller" 2>&1 | grep -qE "active|idle"; then
-                      echo "ERROR: No Juju controller is responsive — cannot safely set bootstrapped flag"
-                      return 1
-                  fi
-              fi
-
-              # Verify at least one model has active units
-              local has_active=false
-              for ctrl in sunbeam-controller localhost-localhost; do
-                  if run_snap_cmd "timeout 30 juju status -m $ctrl:admin/openstack-machines" 2>&1 | grep -qE "k8s/0.*active"; then
-                      has_active=true
-                      break
-                  fi
-              done
-              if ! $has_active; then
-                  echo "ERROR: No k8s unit is active — cannot safely set bootstrapped flag"
-                  return 1
-              fi
           fi
 
           echo "Setting sunbeam_bootstrapped flag to True..."
@@ -376,16 +347,7 @@ write_files:
           local KEYSTONE_URL=""
           for attempt in $(seq 1 5); do
               KEYSTONE_URL=$(run_snap_cmd "juju run -m openstack traefik-public/leader show-proxied-endpoints 2>/dev/null" \
-                  | python3 -c "
-import sys, json, yaml
-data = yaml.safe_load(sys.stdin.read())
-for key, val in data.items():
-    if key == 'proxied-endpoints':
-        endpoints = json.loads(val)
-        if 'keystone' in endpoints:
-            print(endpoints['keystone']['url'])
-            break
-" 2>/dev/null) || true
+                  | python3 -c "import sys,json,yaml; d=yaml.safe_load(sys.stdin); print(json.loads(d.get('proxied-endpoints','{}')).get('keystone',{}).get('url',''))" 2>/dev/null) || true
               if [ -n "$KEYSTONE_URL" ]; then
                   break
               fi
@@ -507,15 +469,129 @@ for key, val in data.items():
       #
       # 'sunbeam cluster bootstrap' IS re-runnable — if it fails mid-way
       # (e.g. during Juju controller migration), re-running it completes
-      # the remaining steps. We handle failures by:
-      #   1. Clearing any stale terraform locks first
-      #   2. Running bootstrap and capturing its exit code
-      #   3. If it fails, clearing locks again and RE-RUNNING bootstrap
-      #      (proven to work for partial migration failures)
-      #   4. If the second attempt also fails, checking cluster health
-      #   5. Only force-setting the bootstrapped flag if the cluster is
-      #      genuinely healthy (k8s active, controller responsive)
+      # the remaining steps.
+      #
+      # Known failure mode: bootstrap crashes during/after Juju model
+      # migration with "connection is shut down" or "migration was aborted".
+      # On re-run, if migration already completed, Sunbeam skips plan1 and
+      # proceeds. But if the migration left stale state (e.g. the migration
+      # flag wasn't set in clusterd, or model agents haven't reconnected),
+      # the re-run will fail.
+      #
+      # Recovery strategy:
+      #   1. Run bootstrap; if it succeeds, done.
+      #   2. On failure, wait 120s for in-flight migration to settle.
+      #   3. Detect and fix partial migration state in clusterd.
+      #   4. Retry bootstrap (up to 2 more times with increasing waits).
+      #   5. If all retries fail, FAIL the phase — do NOT force-set the
+      #      bootstrapped flag, as that causes silent downstream failures.
       # ---------------------------------------------------------------
+
+      # Detect and repair partial Juju model migration state.
+      # This fixes the case where migration completed but Sunbeam's internal
+      # state wasn't updated (e.g. crash between migration and flag-setting).
+
+      # Helper: update JujuController key in clusterd to point to sunbeam-controller.
+      # Reads controller details from juju and writes them to clusterd via API.
+      update_clusterd_juju_controller() {
+          local SOCKET="/var/snap/openstack/common/state/control.socket"
+          echo "  Updating JujuController in clusterd to sunbeam-controller..."
+          local sc_details
+          sc_details=$(run_snap_cmd "juju show-controller sunbeam-controller --format json" 2>/dev/null) || sc_details=""
+          if [ -z "$sc_details" ]; then
+              echo "  WARNING: Could not get sunbeam-controller details from juju"
+              return 1
+          fi
+          local sc_json
+          sc_json=$(echo "$sc_details" | python3 -c "import sys,json; d=json.load(sys.stdin); sc=d.get('sunbeam-controller',{}).get('details',{}); print(json.dumps({'name':'sunbeam-controller','api_endpoints':sc.get('api-endpoints',[]),'ca_cert':sc.get('ca-cert',''),'is_external':False}))" 2>/dev/null) || sc_json=""
+          if [ -z "$sc_json" ]; then
+              echo "  WARNING: Could not parse sunbeam-controller details"
+              return 1
+          fi
+          local sc_escaped
+          sc_escaped=$(echo "$sc_json" | python3 -c 'import sys,json; print(json.dumps(sys.stdin.read().strip()))' 2>/dev/null) || return 1
+          curl -sf --unix-socket "$SOCKET" -X PUT \
+              -d "{\"key\":\"JujuController\",\"value\":$sc_escaped}" \
+              http://localhost/1.0/config/JujuController 2>/dev/null || true
+          echo "  Updated JujuController in clusterd"
+      }
+
+      fix_partial_migration_state() {
+          local SOCKET="/var/snap/openstack/common/state/control.socket"
+          if [ ! -S "$SOCKET" ]; then
+              return 0
+          fi
+
+          echo "Checking Juju model migration state..."
+
+          # Read the migration flag from clusterd
+          local migrated
+          migrated=$(curl -sf --unix-socket "$SOCKET" \
+              http://localhost/1.0/config/juju_controller_migrated_to_k8s 2>/dev/null \
+              | python3 -c "import sys,json; d=json.load(sys.stdin); print(json.loads(d.get('metadata','\"\"')))" 2>/dev/null) || migrated=""
+
+          if [ "$migrated" = "True" ]; then
+              echo "  Migration flag already set in clusterd"
+
+              # Verify the JujuController key points to sunbeam-controller
+              local ctrl_name
+              ctrl_name=$(curl -sf --unix-socket "$SOCKET" \
+                  http://localhost/1.0/config/JujuController 2>/dev/null \
+                  | python3 -c "import sys,json; d=json.load(sys.stdin); print(json.loads(d.get('metadata','{}')).get('name',''))" 2>/dev/null) || ctrl_name=""
+
+              if [ "$ctrl_name" != "sunbeam-controller" ]; then
+                  echo "  WARNING: JujuController in clusterd is '$ctrl_name', not 'sunbeam-controller'"
+                  echo "  Attempting to update JujuController to point to sunbeam-controller..."
+                  update_clusterd_juju_controller
+              else
+                  echo "  JujuController correctly points to sunbeam-controller"
+              fi
+              return 0
+          fi
+
+          # Migration flag is NOT set — check if migration actually completed
+          # (model exists on sunbeam-controller but flag wasn't set)
+          echo "  Migration flag not set — checking if model was already migrated..."
+          local model_on_sc=false
+          if run_snap_cmd "timeout 30 juju models -c sunbeam-controller" 2>&1 | grep -q "openstack-machines"; then
+              model_on_sc=true
+              echo "  Model 'openstack-machines' found on sunbeam-controller!"
+          fi
+
+          if $model_on_sc; then
+              echo "  Setting juju_controller_migrated_to_k8s=True in clusterd..."
+              curl -sf --unix-socket "$SOCKET" -X PUT \
+                  -d '{"key":"juju_controller_migrated_to_k8s","value":"\"True\""}' \
+                  http://localhost/1.0/config/juju_controller_migrated_to_k8s 2>/dev/null || true
+
+              # Update JujuController in clusterd to point to sunbeam-controller
+              update_clusterd_juju_controller
+              echo "  Partial migration state repaired"
+          else
+              echo "  Model not found on sunbeam-controller — migration not yet complete"
+              echo "  Checking if migration is in-flight..."
+              # If sunbeam-controller exists but model isn't there yet,
+              # wait for migration to finish
+              if run_snap_cmd "juju controllers" 2>&1 | grep -q "sunbeam-controller"; then
+                  echo "  sunbeam-controller exists, waiting for migration to complete..."
+                  local wait_ok=false
+                  for i in $(seq 1 12); do
+                      sleep 30
+                      if run_snap_cmd "timeout 30 juju models -c sunbeam-controller" 2>&1 | grep -q "openstack-machines"; then
+                          echo "  Migration completed (attempt $i)"
+                          wait_ok=true
+                          break
+                      fi
+                      echo "  Still waiting for migration... ($i/12)"
+                  done
+                  if $wait_ok; then
+                      # Recursively fix state now that migration is done
+                      fix_partial_migration_state
+                  fi
+              fi
+          fi
+      }
+
       bootstrap_sunbeam() {
           # Clear any stale terraform locks from previous attempts
           clear_stale_terraform_locks
@@ -533,85 +609,63 @@ for key, val in data.items():
           fi
 
           echo "WARNING: bootstrap exited with code $rc — attempting recovery..."
-          echo "Waiting 60s before retry..."
-          sleep 60
+          echo "  Common causes: 'connection is shut down' during migration,"
+          echo "  'model migration was aborted', or transient Juju errors."
 
-          # Re-running bootstrap completes any partial work (e.g. unfinished
-          # Juju controller migration). Clear locks first.
+          # Wait 120s for any in-flight migration to settle. The Juju model
+          # migration includes agent reconnection which can take 1-2 minutes.
+          echo "Waiting 120s for in-flight operations to settle..."
+          sleep 120
+
+          # Detect and fix partial migration state before retrying
+          fix_partial_migration_state
           clear_stale_terraform_locks
 
-          local rc2=0
-          echo "=== Re-running sunbeam cluster bootstrap (recovery attempt) ==="
-          run_snap_cmd "sunbeam cluster bootstrap \
-              --manifest /home/ubuntu/manifest.yaml \
-              --role control,compute,storage \
-              --accept-defaults" || rc2=$?
+          # Retry loop: up to 2 more attempts with increasing waits
+          local attempt
+          for attempt in 2 3; do
+              echo "=== Bootstrap attempt $attempt/3 ==="
+              local rc_retry=0
+              run_snap_cmd "sunbeam cluster bootstrap \
+                  --manifest /home/ubuntu/manifest.yaml \
+                  --role control,compute,storage \
+                  --accept-defaults" || rc_retry=$?
 
-          if [ "$rc2" -eq 0 ]; then
-              echo "Bootstrap recovery succeeded on re-run"
-              ensure_bootstrapped_flag
-              return 0
-          fi
-
-          echo "WARNING: bootstrap re-run also failed (exit $rc2) — checking cluster health..."
-          sleep 60
-
-          # Check if cluster is actually functional despite the error.
-          # NOTE: After successful bootstrap, the openstack-machines model
-          # migrates from localhost-localhost to sunbeam-controller. We must
-          # check BOTH controllers since we don't know which state we're in.
-          local cluster_ok=false
-          for attempt in $(seq 1 10); do
-              echo "Health check attempt $attempt/10..."
-
-              # Check 1: Is the node ONLINE in sunbeam cluster list?
-              if run_snap_cmd "sunbeam cluster list" 2>&1 | grep -q "ONLINE"; then
-                  echo "  Cluster shows ONLINE"
-
-                  # Check 2: Is the k8s unit active/idle?
-                  # Try sunbeam-controller first (post-migration), fall back to localhost-localhost (pre-migration)
-                  local k8s_ok=false
-                  for ctrl in sunbeam-controller localhost-localhost; do
-                      if run_snap_cmd "timeout 30 juju status -m $ctrl:admin/openstack-machines" 2>&1 | grep -q "k8s/0.*active.*idle"; then
-                          echo "  k8s/0 is active/idle (via $ctrl)"
-                          k8s_ok=true
-                          break
-                      fi
-                  done
-
-                  if $k8s_ok; then
-                      # Check 3: Is the sunbeam-controller working?
-                      if run_snap_cmd "timeout 15 juju status -m sunbeam-controller:controller" 2>&1 | grep -q "controller/0.*active"; then
-                          echo "  sunbeam-controller is healthy"
-                          cluster_ok=true
-                          break
-                      else
-                          # sunbeam-controller model may not exist yet — if k8s is healthy, that's enough
-                          echo "  sunbeam-controller check inconclusive, but k8s is healthy"
-                          cluster_ok=true
-                          break
-                      fi
-                  fi
+              if [ "$rc_retry" -eq 0 ]; then
+                  echo "Bootstrap succeeded on attempt $attempt"
+                  ensure_bootstrapped_flag
+                  return 0
               fi
 
-              echo "  Cluster not yet healthy, waiting 30s..."
-              sleep 30
+              echo "Bootstrap attempt $attempt failed (exit $rc_retry)"
+
+              if [ "$attempt" -lt 3 ]; then
+                  local wait_secs=$((120 * attempt))
+                  echo "Waiting $${wait_secs}s before next attempt..."
+                  sleep "$wait_secs"
+                  fix_partial_migration_state
+                  clear_stale_terraform_locks
+              fi
           done
 
-          if $cluster_ok; then
-              echo "Cluster is healthy despite bootstrap errors — proceeding"
-              ensure_bootstrapped_flag recovery
-              return 0
-          else
-              echo "FATAL: Bootstrap failed after 2 attempts and cluster is not healthy"
-              echo "--- sunbeam cluster list ---"
-              run_snap_cmd "sunbeam cluster list" 2>&1 || true
-              echo "--- juju status openstack-machines (sunbeam-controller) ---"
-              run_snap_cmd "timeout 30 juju status -m sunbeam-controller:admin/openstack-machines" 2>&1 || true
-              echo "--- juju status openstack-machines (localhost-localhost) ---"
-              run_snap_cmd "timeout 30 juju status -m localhost-localhost:admin/openstack-machines" 2>&1 || true
-              return 1
-          fi
+          # All attempts failed — dump diagnostics and fail hard.
+          # Do NOT force-set sunbeam_bootstrapped: doing so causes silent
+          # failures in later phases (e.g. 'sunbeam cluster add' fails to
+          # grant model access because the openstack model doesn't exist).
+          echo "FATAL: Bootstrap failed after 3 attempts"
+          echo "--- sunbeam cluster list ---"
+          run_snap_cmd "sunbeam cluster list" 2>&1 || true
+          echo "--- juju controllers ---"
+          run_snap_cmd "juju controllers" 2>&1 || true
+          echo "--- juju status openstack-machines (sunbeam-controller) ---"
+          run_snap_cmd "timeout 30 juju status -m sunbeam-controller:admin/openstack-machines" 2>&1 || true
+          echo "--- juju status openstack-machines (localhost-localhost) ---"
+          run_snap_cmd "timeout 30 juju status -m localhost-localhost:admin/openstack-machines" 2>&1 || true
+          echo "--- clusterd config dump ---"
+          for key in JujuController juju_controller_migrated_to_k8s sunbeam_bootstrapped; do
+              echo "  $key: $(curl -sf --unix-socket /var/snap/openstack/common/state/control.socket http://localhost/1.0/config/$key 2>/dev/null || echo 'not set')"
+          done
+          return 1
       }
       run_phase "03-bootstrap" bootstrap_sunbeam
 
